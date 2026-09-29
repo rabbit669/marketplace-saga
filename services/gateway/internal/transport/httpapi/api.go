@@ -12,6 +12,7 @@ import (
 	"github.com/marketplace/pkg/apperr"
 	"github.com/marketplace/pkg/jwtx"
 	authv1 "github.com/marketplace/pkg/proto/auth/v1"
+	catalogv1 "github.com/marketplace/pkg/proto/catalog/v1"
 	orderv1 "github.com/marketplace/pkg/proto/order/v1"
 	"github.com/marketplace/pkg/ratelimit"
 	"github.com/redis/go-redis/v9"
@@ -46,6 +47,8 @@ type Config struct {
 	Metrics HTTPMetrics
 	// OrderClient is the connection to the order service.
 	OrderClient orderv1.OrderServiceClient
+	// CatalogClient lists products for the demo storefront.
+	CatalogClient catalogv1.CatalogServiceClient
 	// AuthClient is the connection to the identity service. It is used only for
 	// registration and login; token verification stays local, because a network
 	// hop on every request would make the auth service a hard dependency of
@@ -59,6 +62,7 @@ type Server struct {
 	log         *slog.Logger
 	orders      orderv1.OrderServiceClient
 	auth        authv1.AuthServiceClient
+	catalog     catalogv1.CatalogServiceClient
 	limiter     ratelimit.Limiter
 	authLimiter ratelimit.Limiter
 }
@@ -95,6 +99,7 @@ func NewServer(cfg Config) (*Server, error) {
 		log:         cfg.Logger,
 		orders:      cfg.OrderClient,
 		auth:        cfg.AuthClient,
+		catalog:     cfg.CatalogClient,
 		limiter:     newLimiter(cfg.Redis, cfg.RateLimit, "customer"),
 		authLimiter: newLimiter(cfg.Redis, cfg.AuthRateLimit, "address"),
 	}, nil
@@ -153,6 +158,10 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /v1/auth/login", route(withRateLimit(s.authLimiter, "address")(s.handleLogin())))
 		mux.Handle("POST /v1/auth/refresh", route(withRateLimit(s.authLimiter, "address")(s.handleRefresh())))
 	}
+
+	// The demo storefront, and the product listing it needs. Both are public:
+	// a shop window does not require a token, and the page itself is static.
+	s.registerUIRoutes(mux, route)
 
 	// Authenticated.
 	mux.Handle("POST /v1/orders", route(requireAuth(s.handleCreateOrder())))

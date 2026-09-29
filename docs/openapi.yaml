@@ -30,6 +30,8 @@ servers:
 tags:
   - name: auth
     description: Registration, login and token refresh. Public.
+  - name: catalog
+    description: The sellable catalogue. Public.
   - name: orders
     description: Checkout and order inspection. Requires a bearer token.
 
@@ -147,6 +149,31 @@ paths:
               schema: { $ref: "#/components/schemas/TokenPair" }
         "401":
           description: The refresh token is not valid, has expired, or was already used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/products:
+    get:
+      tags: [catalog]
+      summary: List the sellable catalogue
+      description: |
+        Backs the demo storefront's product grid. Public: a shop window does not
+        require a token.
+      responses:
+        "200":
+          description: The active products.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  products:
+                    type: array
+                    items: { $ref: "#/components/schemas/Product" }
+        "503":
+          description: The catalogue is not configured on this gateway.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -473,6 +500,18 @@ components:
         idempotency_key:
           type: string
           description: Fallback for the header. The header wins when both are present.
+
+    Product:
+      type: object
+      properties:
+        id: { type: string }
+        sku: { type: string }
+        name: { type: string }
+        price: { $ref: "#/components/schemas/Money" }
+        category_id: { type: string }
+        attributes:
+          type: object
+          additionalProperties: { type: string }
 
     OrderLine:
       type: object

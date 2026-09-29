@@ -15,6 +15,7 @@ import (
 	"github.com/marketplace/pkg/apperr"
 	"github.com/marketplace/pkg/jwtx"
 	authv1 "github.com/marketplace/pkg/proto/auth/v1"
+	catalogv1 "github.com/marketplace/pkg/proto/catalog/v1"
 	commonv1 "github.com/marketplace/pkg/proto/common/v1"
 	orderv1 "github.com/marketplace/pkg/proto/order/v1"
 	"github.com/marketplace/pkg/ratelimit"
@@ -130,9 +131,10 @@ func newHarness(t *testing.T, cfg func(*httpapi.Config)) *harness {
 			TTL:    time.Hour,
 			Now:    func() time.Time { return h.now },
 		},
-		RateLimit:   ratelimit.Config{PerSecond: 1000, Burst: 1000},
-		OrderClient: h.orders,
-		AuthClient:  fakeAuth{},
+		RateLimit:     ratelimit.Config{PerSecond: 1000, Burst: 1000},
+		OrderClient:   h.orders,
+		AuthClient:    fakeAuth{},
+		CatalogClient: fakeCatalog{},
 	}
 	if cfg != nil {
 		cfg(&c)
@@ -621,4 +623,121 @@ func TestRateLimit_DoesNotThrottleAuthenticatedRoutesByAddress(t *testing.T) {
 	if !throttled {
 		t.Error("login was never throttled; the address limiter is not protecting it")
 	}
+}
+
+func TestUI_IsServedAndTheRootRedirects(t *testing.T) {
+	// The storefront is embedded in the gateway, so "the demo is missing" is a
+	// build problem rather than a deployment one. These assertions are what make
+	// that visible in CI instead of in a browser.
+	h := newHarness(t, nil)
+
+	t.Run("the root redirects to the app", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := h.do(t, req)
+
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302", rec.Code)
+		}
+		if got := rec.Header().Get("Location"); got != "/ui/" {
+			t.Errorf("Location = %q, want /ui/", got)
+		}
+	})
+
+	t.Run("the page is served", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		rec := h.do(t, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "<title>") {
+			t.Error("the response is not an HTML document")
+		}
+	})
+
+	t.Run("the assets are served", func(t *testing.T) {
+		for _, asset := range []string{"/ui/app.js", "/ui/styles.css"} {
+			req := httptest.NewRequest(http.MethodGet, asset, nil)
+			if rec := h.do(t, req); rec.Code != http.StatusOK {
+				t.Errorf("GET %s = %d, want 200", asset, rec.Code)
+			}
+		}
+	})
+
+	t.Run("an unknown API path still answers with an error, not the page", func(t *testing.T) {
+		// The classic single-page-app failure: a catch-all route turns every
+		// mistyped API call into a 200 carrying HTML, and the client's JSON
+		// parser reports something unrelated to the actual mistake.
+		token := h.token(t, "cust-1")
+		req := httptest.NewRequest(http.MethodGet, "/v1/nope", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		rec := h.do(t, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "<title>") {
+			t.Error("an API path returned the HTML page")
+		}
+	})
+}
+
+func TestProducts_ListsTheCatalogue(t *testing.T) {
+	h := newHarness(t, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/products", nil)
+	rec := h.do(t, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Products []struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Price struct {
+				AmountMinor int64  `json:"amount_minor"`
+				Currency    string `json:"currency"`
+			} `json:"price"`
+		} `json:"products"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v\n%s", err, rec.Body.String())
+	}
+
+	if body.Count != 2 || len(body.Products) != 2 {
+		t.Fatalf("count = %d, products = %d, want 2", body.Count, len(body.Products))
+	}
+	if body.Products[0].Price.AmountMinor <= 0 {
+		t.Error("prices are missing; the storefront would render every product as free")
+	}
+}
+
+// fakeCatalog is a stub catalogue.
+type fakeCatalog struct{}
+
+func (fakeCatalog) CreateProduct(context.Context, *catalogv1.CreateProductRequest, ...grpc.CallOption) (*catalogv1.CreateProductResponse, error) {
+	return nil, nil
+}
+func (fakeCatalog) GetProduct(context.Context, *catalogv1.GetProductRequest, ...grpc.CallOption) (*catalogv1.GetProductResponse, error) {
+	return nil, nil
+}
+func (fakeCatalog) GetProductBySKU(context.Context, *catalogv1.GetProductBySKURequest, ...grpc.CallOption) (*catalogv1.GetProductBySKUResponse, error) {
+	return nil, nil
+}
+func (fakeCatalog) ListProducts(context.Context, *catalogv1.ListProductsRequest, ...grpc.CallOption) (*catalogv1.ListProductsResponse, error) {
+	return &catalogv1.ListProductsResponse{
+		Products: []*catalogv1.Product{
+			{Id: "p-1", Sku: "KETTLE-01", Name: "Kettle", Price: &commonv1.Money{AmountMinor: 3999, Currency: "USD"}, Active: true},
+			{Id: "p-2", Sku: "MUG-02", Name: "Mug", Price: &commonv1.Money{AmountMinor: 2450, Currency: "USD"}, Active: true},
+		},
+	}, nil
+}
+func (fakeCatalog) UpdateProduct(context.Context, *catalogv1.UpdateProductRequest, ...grpc.CallOption) (*catalogv1.UpdateProductResponse, error) {
+	return nil, nil
+}
+func (fakeCatalog) GetProductsBatch(context.Context, *catalogv1.GetProductsBatchRequest, ...grpc.CallOption) (*catalogv1.GetProductsBatchResponse, error) {
+	return nil, nil
 }

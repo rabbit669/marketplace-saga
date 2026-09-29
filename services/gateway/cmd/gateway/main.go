@@ -18,6 +18,7 @@ import (
 	"github.com/marketplace/pkg/grpcx"
 	"github.com/marketplace/pkg/jwtx"
 	authv1 "github.com/marketplace/pkg/proto/auth/v1"
+	catalogv1 "github.com/marketplace/pkg/proto/catalog/v1"
 	orderv1 "github.com/marketplace/pkg/proto/order/v1"
 	"github.com/marketplace/pkg/ratelimit"
 	"github.com/redis/go-redis/v9"
@@ -87,6 +88,19 @@ func run(ctx context.Context, rt *bootstrap.Runtime) error {
 	}
 	defer func() { _ = authConn.Close() }()
 
+	catalogTarget := rt.Shared.String("CATALOG_GRPC_TARGET", "catalog:9092")
+
+	catalogConn, err := grpcx.Dial(ctx, grpcx.ClientConfig{
+		Name:    "catalog",
+		Target:  catalogTarget,
+		Logger:  rt.Log,
+		Timeout: rt.Shared.Duration("GRPC_CALL_TIMEOUT", 10*time.Second),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = catalogConn.Close() }()
+
 	conn, err := grpcx.Dial(ctx, grpcx.ClientConfig{
 		Name:    "order",
 		Target:  orderTarget,
@@ -120,6 +134,7 @@ func run(ctx context.Context, rt *bootstrap.Runtime) error {
 		Metrics:         rt.Metrics,
 		OrderClient:     orderv1.NewOrderServiceClient(conn),
 		AuthClient:      authv1.NewAuthServiceClient(authConn),
+		CatalogClient:   catalogv1.NewCatalogServiceClient(catalogConn),
 	})
 	if err != nil {
 		return err
@@ -132,6 +147,7 @@ func run(ctx context.Context, rt *bootstrap.Runtime) error {
 	rt.Log.Info("gateway ready",
 		"http_addr", rt.Config.String("HTTP_ADDR", ":8080"),
 		"order_target", orderTarget,
+		"catalog_target", catalogTarget,
 		"rate_limit_rps", rt.Shared.Float64("RATE_LIMIT_RPS", 50),
 	)
 

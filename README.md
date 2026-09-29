@@ -56,6 +56,7 @@ The project is built in stages; this section is kept honest as it progresses.
 | Catalog, inventory and payment services over gRPC | ✅ done |
 | API gateway: JWT, rate limiting, REST to gRPC | ✅ done |
 | Checkout demo running end to end | ✅ **verified** |
+| Embedded storefront at `/ui/` with a saga timeline | ✅ done |
 | Auth service: registration, login, refresh rotation, reuse detection | ✅ done |
 | Gateway auth routes (`/v1/auth/*`) | ✅ done |
 | PostgreSQL for the order service: migrations, optimistic locking, outbox | ✅ done |
@@ -111,7 +112,17 @@ immediately; so would every customer behind a corporate NAT.
 
 ## Try it
 
-With the stack up:
+`make up` opens the storefront when the gateway is ready — a product grid, a
+cart, and a payment-method selector whose options are *make this payment
+decline*, *make this payment time out* and *let it through*. Placing an order
+renders the saga's five steps with their real outcome, so the rollback is
+something you watch rather than something you read about.
+
+It is plain HTML, CSS and one JavaScript file, embedded in the gateway binary:
+no second container, no CORS, no build step. A bundler would make the demo the
+most complicated part of the repository.
+
+Underneath, the same things the API exposes:
 
 ```bash
 make demo      # runs the three scenarios above against the live API

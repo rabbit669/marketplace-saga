@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marketplace — checkout saga</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>Marketplace</h1>
+    <p class="tagline">
+      Микросервисный checkout. Оформите заказ и посмотрите, что происходит,
+      когда карта отклонена.
+    </p>
+    <p class="who" id="who"></p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ============================================================ shop -->
+  <section id="shop-section">
+    <h2>Витрина</h2>
+    <div id="products" class="grid">
+      <p class="muted">Загружаю товары…</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ cart -->
+  <section id="cart-section" hidden>
+    <h2>Корзина</h2>
+    <table class="cart">
+      <tbody id="cart-rows"></tbody>
+      <tfoot>
+        <tr>
+          <th>Итого</th>
+          <th id="cart-total" class="money"></th>
+        </tr>
+      </tfoot>
+    </table>
+
+    <fieldset class="pay">
+      <legend>Чем платим</legend>
+      <p class="muted small">
+        Платёжный сервис умеет притворяться. Выберите исход — и увидите,
+        как сага на него реагирует.
+      </p>
+
+      <label class="choice">
+        <input type="radio" name="card" value="pm_test_approve" checked>
+        <span><b>Обычная карта</b> — оплата проходит</span>
+      </label>
+
+      <label class="choice">
+        <input type="radio" name="card" value="pm_test_decline">
+        <span><b>Карта без денег</b> — банк отказывает навсегда</span>
+      </label>
+
+      <label class="choice">
+        <input type="radio" name="card" value="pm_test_timeout">
+        <span><b>Банк недоступен</b> — отказ временный, сага повторит попытку</span>
+      </label>
+
+      <fieldset class="ship">
+        <legend>Доставка</legend>
+        <div class="addr">
+          <label>Страна <input id="ship-country" value="DE"></label>
+          <label>Город <input id="ship-city" value="Berlin"></label>
+          <label>Улица <input id="ship-street" value="Torstrasse 1"></label>
+          <label>Индекс <input id="ship-postal" value="10119"></label>
+          <label>Получатель <input id="ship-recipient" value="A. Customer"></label>
+        </div>
+      </fieldset>
+
+      <button id="pay-btn" class="primary">Оплатить</button>
+    </fieldset>
+  </section>
+
+  <!-- ========================================================== result -->
+  <section id="result-section" hidden>
+    <h2 id="result-title"></h2>
+    <p id="result-summary" class="summary"></p>
+
+    <div id="result-failure" class="failure" hidden>
+      <div class="failure-head">
+        <span class="failure-code" id="failure-code"></span>
+        <span id="failure-message"></span>
+      </div>
+      <p class="muted small" id="failure-step"></p>
+    </div>
+
+    <h3>Что делала сага</h3>
+    <p class="muted small">
+      Пять шагов. Первые два можно отменить, третий — точка невозврата.
+      Если шаг падает, всё, что было до него, отменяется в обратном порядке.
+    </p>
+
+    <ol id="saga-steps" class="saga"></ol>
+
+    <div class="links">
+      <a id="jaeger-link" target="_blank" rel="noopener">Открыть трейс в Jaeger</a>
+      <button id="again-btn" class="secondary">Оформить ещё один</button>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
