@@ -1,0 +1,219 @@
+# =============================================================================
+#  Kafka — single-node KRaft (no ZooKeeper: the broker is its own controller).
+#
+#  A StatefulSet with a PersistentVolumeClaim: the log directory holds committed
+#  events that services have not consumed yet, and losing it means losing the
+#  outbox's published-but-unconsumed work.
+#
+#  Ports, from deploy/docker-compose.yml:
+#    9092   INTERNAL    the listener the services use (KAFKA_BROKERS=kafka:9092)
+#    9093   CONTROLLER  the KRaft quorum listener; with one node the voter address
+#                       is 1@kafka:9093, i.e. this broker itself
+#    29092  EXTERNAL    deliberately absent here — see KAFKA_LISTENERS below.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: messaging
+    app.kubernetes.io/part-of: marketplace
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: internal
+      port: 9092
+      targetPort: internal
+      protocol: TCP
+    # Published because KAFKA_ADVERTISED_LISTENERS and the KRaft quorum voter
+    # address both name `kafka:9093`: the broker resolves its own controller
+    # address through this Service, which is why the Kafka policy in
+    # networkpolicy-infra.yaml has to allow the pod to reach itself.
+    - name: controller
+      port: 9093
+      targetPort: controller
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: messaging
+    app.kubernetes.io/part-of: marketplace
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/part-of: marketplace
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/component: messaging
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      # The broker flushes logs and leaves the consumer group on SIGTERM; 60s
+      # covers an unclean-but-graceful stop of a small local cluster.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # No runAsUser: the apache/kafka image already runs as its own non-root
+        # appuser (uid 1000), and overriding a uid that the image's own file
+        # permissions were built around is a good way to make the data volume
+        # unwritable. fsGroup matches that uid so a freshly provisioned PVC
+        # (owned by root) is writable at all. If the image tag is ever changed,
+        # check `docker inspect` for the user before changing either line.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: internal
+              containerPort: 9092
+              protocol: TCP
+            - name: controller
+              containerPort: 9093
+              protocol: TCP
+          env:
+            # Copied from deploy/docker-compose.yml, with one deliberate change:
+            # the EXTERNAL listener is removed. compose advertises
+            # `EXTERNAL://localhost:29092` so that host tools such as kcat can
+            # reach the broker. In-cluster there is no host listener, and because
+            # the *advertised* address is what a client is told to dial, leaving it
+            # in place would hand clients an address that cannot resolve — an
+            # unreachable advertised listener fails more confusingly than a missing
+            # one. Re-add EXTERNAL here, with a reachable address, if a host tool
+            # needs the broker.
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka:9093"
+            - name: KAFKA_LISTENERS
+              value: "INTERNAL://:9092,CONTROLLER://:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "INTERNAL://kafka:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "INTERNAL"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            # Single node means every replication factor must be 1: a replication
+            # factor above the number of brokers is the classic way to make a
+            # one-broker cluster refuse to create internal topics.
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            # Auto-creation is a development affordance: it means the first
+            # producer to a topic name creates it. A real deployment turns this off
+            # and creates topics explicitly, so that retention and partition count
+            # are decisions rather than defaults.
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: KAFKA_LOG_RETENTION_HOURS
+              value: "24"
+            - name: CLUSTER_ID
+              value: "MkU3OEVBNTcwNTJENDM2Qk"
+            # Set explicitly rather than left to the image: the log directory must
+            # be the volume compose mounts (and the one mounted below), or the
+            # broker's data lands in the container's writable layer and disappears
+            # with the pod.
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+          # ------------------------------------------------------------ probes
+          #
+          # kafka-broker-api-versions.sh is the compose healthcheck and it asks the
+          # right question: not "is the port open" but "does this broker answer the
+          # Kafka protocol". A JVM that is up but still formatting the log
+          # directory fails it, which is exactly what should keep the pod unready.
+          #
+          # Startup 10s x 18 = 180s: a first start formats the log directory and
+          # starts a JVM. Liveness is slow (30s x 3 = 90s) and deliberately so —
+          # Kafka is a JVM with long GC pauses and a rebalance state machine, so a
+          # restart triggered by a busy moment costs far more than a late restart.
+          startupProbe:
+            exec:
+              command:
+                - /opt/kafka/bin/kafka-broker-api-versions.sh
+                - --bootstrap-server
+                - localhost:9092
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 18
+          readinessProbe:
+            exec:
+              command:
+                - /opt/kafka/bin/kafka-broker-api-versions.sh
+                - --bootstrap-server
+                - localhost:9092
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /opt/kafka/bin/kafka-broker-api-versions.sh
+                - --bootstrap-server
+                - localhost:9092
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # --------------------------------------------------------- resources
+          #
+          # How the memory figure was chosen: this is a JVM, so the container limit
+          # has to cover the heap *plus* the off-heap that Kafka is fond of (page
+          # cache for log segments, the network buffers, the metadata caches). The
+          # image's default heap is around 1G; 2Gi of limit leaves the rest for
+          # off-heap, and the 1Gi request is the resident set of an idle single-node
+          # broker. KAFKA_HEAP_OPTS is not set here, so if the limit is lowered,
+          # set it lower in the same change — a JVM that exceeds its cgroup limit is
+          # killed, and the broker's log directory survives but its in-flight work
+          # does not.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: kafka
+          app.kubernetes.io/part-of: marketplace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,153 @@
+# =============================================================================
+#  payment — the payment provider adapter, with idempotency and simulated
+#  declines.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9095   grpc    called by order, and only by order   PAYMENT_GRPC_ADDR
+#    9195   health  /healthz /readyz /version /metrics   PAYMENT_HEALTH_ADDR
+#
+#  The failure rate and the added latency are not accidents: they are how the
+#  saga's compensation path gets exercised on ordinary traffic instead of only in
+#  tests. In a real deployment these numbers come from the provider and from
+#  measurement, not from configuration.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: payment
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: payment
+          image: marketplace/payment:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9095
+              protocol: TCP
+            - name: health
+              containerPort: 9195
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "payment"
+            - name: PAYMENT_GRPC_ADDR
+              value: ":9095"
+            - name: PAYMENT_HEALTH_ADDR
+              value: ":9195"
+            # Deliberately non-zero: the saga's rollback path is the point of this
+            # service, and a payment provider that never declines would leave it
+            # exercised only by tests. Set to 0 when simulating a happy path.
+            - name: PAYMENT_FAILURE_RATE
+              value: "0.15"
+            # Simulated provider latency, in milliseconds.
+            - name: PAYMENT_LATENCY_MS
+              value: "50"
+            - name: PAYMENT_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: PAYMENT_DB_DSN
+          # The idempotency records are the interesting state here: a retry with
+          # the same key must return the original charge rather than create a
+          # second one, so readiness must not be reported before the store is
+          # usable. 60s of startup budget.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: payment
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: payment
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 9195
+      targetPort: health
+      protocol: TCP

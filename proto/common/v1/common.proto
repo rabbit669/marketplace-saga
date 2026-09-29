@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package common.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Money is an exact monetary amount. It is deliberately never a float:
+// amounts are stored in minor units (cents, kopecks) as integers, which keeps
+// arithmetic associative and rounding explicit.
+message Money {
+  // Amount in minor units of the currency. 12.34 USD => 1234.
+  int64 amount_minor = 1;
+  // ISO-4217 alphabetic code, e.g. "USD", "EUR", "RUB".
+  string currency = 2;
+}
+
+// PageRequest is the shared cursor-pagination input.
+message PageRequest {
+  // Maximum number of items to return. Server clamps this to a sane maximum.
+  int32 page_size = 1;
+  // Opaque cursor returned by a previous call. Empty means "from the start".
+  string page_token = 2;
+}
+
+// PageResponse carries the cursor for the next page.
+message PageResponse {
+  // Empty when there are no further pages.
+  string next_page_token = 1;
+  // Total number of items known to match the query, when cheap to compute.
+  // Zero is ambiguous: it may also mean "not counted".
+  int32 total_size = 2;
+}
+
+// Address is a shipping destination.
+message Address {
+  string country = 1; // ISO-3166-1 alpha-2
+  string city = 2;
+  string street = 3;
+  string postal_code = 4;
+  string recipient = 5;
+}
+
+// AuditInfo records who changed a record and when. Kept on aggregate roots so
+// that every service answers "who did this?" without a separate audit table.
+message AuditInfo {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Timestamp updated_at = 2;
+  string created_by = 3;
+  string updated_by = 4;
+}

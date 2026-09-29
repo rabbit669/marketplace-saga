@@ -1,0 +1,45 @@
+# ---- build artifacts ----
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Running `go build ./...` inside a service module writes the binary next to the
+# main package, named after the service. Makefile targets build into ./bin, but
+# a bare `go build` does not, so these are listed explicitly.
+/services/*/auth
+/services/*/catalog
+/services/*/gateway
+/services/*/inventory
+/services/*/notification
+/services/*/order
+/services/*/payment
+
+# ---- go ----
+vendor/
+
+# ---- local toolchain (portable Go installed by tooling) ----
+/.toolchain/
+/.tools/
+
+# ---- secrets & local overrides ----
+.env
+.env.*
+!.env.example
+*.local.yml
+
+# ---- coverage ----
+coverage.*
+*.coverprofile
+cover.html
+
+# ---- editors / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ---- runtime ----
+/tmp/
+*.log

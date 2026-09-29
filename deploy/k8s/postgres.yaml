@@ -1,0 +1,270 @@
+# =============================================================================
+#  PostgreSQL — one server, one logical database per service.
+#
+#  A StatefulSet, not a Deployment: this is the only component in the stack whose
+#  identity and storage must survive a reschedule, and the volume has to follow
+#  the same pod back. Replicas stay at 1 — two PostgreSQL pods against one volume
+#  is not "high availability", it is a corrupted database; real HA here means a
+#  primary with a streaming replica, which is a different manifest.
+#
+#  Service name kept as `postgres` so that the hostname published in .env.example
+#  and deploy/docker-compose.yml is the same string in both stacks, and so the
+#  DSNs in marketplace-secrets need no rewriting.
+#
+#  Ports: 5432, matching compose (whose 5432 host port is a compose-only concern).
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: marketplace
+data:
+  # Byte-for-byte the contents of deploy/postgres/init.sql, which compose mounts
+  # at the same path (/docker-entrypoint-initdb.d/00-init.sql). It is duplicated
+  # rather than referenced because kustomize refuses to load files outside its own
+  # directory, so a change there has to be copied here — the scripts are short and
+  # the databases they create are the contract between the two stacks.
+  #
+  # These statements run once, on first initdb of an empty data directory. They do
+  # not run again on a restart, so a database added here after the first start
+  # must be created by hand or by the owning service's migrations.
+  00-init.sql: |
+    -- =============================================================================
+    --  Initial database layout.
+    --
+    --  One database per service. This is not decoration: it makes accidental
+    --  cross-service joins impossible rather than merely discouraged, and it means
+    --  a service can be extracted to its own server without a migration project.
+    --
+    --  No foreign keys ever cross these boundaries. Referential integrity between
+    --  services is maintained by the saga, not by the database.
+    -- =============================================================================
+
+    CREATE DATABASE auth_db;
+    CREATE DATABASE catalog_db;
+    CREATE DATABASE inventory_db;
+    CREATE DATABASE order_db;
+    CREATE DATABASE payment_db;
+    CREATE DATABASE notification_db;
+
+    \connect auth_db
+    COMMENT ON DATABASE auth_db IS 'auth service: users, credentials, refresh tokens';
+
+    \connect catalog_db
+    COMMENT ON DATABASE catalog_db IS 'catalog service: products and categories';
+
+    \connect inventory_db
+    COMMENT ON DATABASE inventory_db IS 'inventory service: stock levels and reservations';
+
+    \connect order_db
+    COMMENT ON DATABASE order_db IS 'order service: orders, saga state, outbox';
+
+    \connect payment_db
+    COMMENT ON DATABASE payment_db IS 'payment service: payments, idempotency records, outbox';
+
+    \connect notification_db
+    COMMENT ON DATABASE notification_db IS 'notification service: processed event ids, for deduplication';
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: datastore
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # Headless: the clients want the pod's address, not a load-balanced virtual IP.
+  # With one replica the difference is cosmetic; it stops being cosmetic the
+  # moment this becomes a primary plus a replica, and clients that were already
+  # talking to the pod do not have to change.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: datastore
+    app.kubernetes.io/part-of: marketplace
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/part-of: marketplace
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: datastore
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      # 60s, not the default 30s: on SIGTERM PostgreSQL runs a shutdown checkpoint,
+      # and a grace period that expires mid-checkpoint converts a clean stop into
+      # crash recovery on the next start (which is slower, and on a large database
+      # can be much slower).
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # fsGroup 70 is the postgres user's group inside the image. It makes the
+        # volume group-writable for the user the entrypoint drops to, which is what
+        # allows the server to work with a freshly provisioned PVC whose root
+        # directory belongs to root.
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            # Same four settings, and the same values, as the postgres service in
+            # deploy/docker-compose.yml. POSTGRES_USER and POSTGRES_DB are not
+            # secrets and are written out here rather than in the shared
+            # ConfigMap: they are properties of this container, and the services
+            # never read them (each service reads a complete DSN from
+            # marketplace-secrets).
+            - name: POSTGRES_USER
+              value: "marketplace"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: "postgres"
+            # Faster and quieter than the default for a development database, and
+            # it makes test runs reproducible without waiting on the WAL flusher.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--data-checksums"
+            # PGDATA is a subdirectory of the mount rather than the mount itself.
+            # A mount root can contain a lost+found (on some volume plugins) or be
+            # owned by root, and initdb refuses to run in a non-empty directory —
+            # the subdirectory gives it one it owns. compose mounts the root
+            # directly, which works on a Docker named volume but is not portable.
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          # ------------------------------------------------------------ probes
+          #
+          # These are exec probes, not HTTP: PostgreSQL has no HTTP endpoint, and
+          # pg_isready is the same check the compose healthcheck uses. The image
+          # has a shell (unlike the distroless service images), so the probe reads
+          # POSTGRES_USER from the environment instead of duplicating the literal
+          # in two places.
+          #
+          # Durations: startup 5s x 30 = 150s covers initdb plus the init scripts
+          # on a fresh volume, which is the slowest thing this pod ever does.
+          # Readiness is quick (a database that cannot accept a connection is not
+          # ready). Liveness is deliberately slow — 15s period, 6 failures = 90s —
+          # because restarting a database is a last resort: a server that is busy
+          # is not a server that is wedged, and a needless restart costs far more
+          # than a slow probe does.
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'pg_isready -U "$POSTGRES_USER" -d postgres'
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'pg_isready -U "$POSTGRES_USER" -d postgres'
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'pg_isready -U "$POSTGRES_USER" -d postgres'
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # --------------------------------------------------------- resources
+          #
+          # How the memory figure was chosen: PostgreSQL sizes itself from its own
+          # configuration, not from the cgroup limit. The image's defaults are
+          # shared_buffers = 128MB plus work_mem = 4MB *per sort/hash node per
+          # connection*, so the ceiling that matters is 128MB + (4MB x connections).
+          # At the connection counts this stack opens (six services, a small pool
+          # each) that lands comfortably under 1Gi, and the 256Mi request is the
+          # resident set of an idle server with those six schemas loaded. If the
+          # pools or work_mem are raised, raise the limit with them — an OOM kill of
+          # PostgreSQL is not a graceful failure.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            # postgres:16-alpine starts as root on purpose: its entrypoint fixes
+            # the ownership of PGDATA and then drops to the postgres user with
+            # gosu. Dropping all capabilities would break that handover, so the
+            # five it actually needs are named explicitly instead of being left
+            # implicit — and nothing else, notably not NET_RAW or SYS_ADMIN.
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN        # chown PGDATA to the postgres user
+                - DAC_OVERRIDE # write into a root-owned mount root
+                - FOWNER       # chmod files it does not own during initdb
+                - SETGID       # gosu: drop to the postgres group
+                - SETUID       # gosu: drop to the postgres user
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d/00-init.sql
+              subPath: 00-init.sql
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+  # The volume claim template is why this is a StatefulSet: the PVC is created with
+  # the pod and is not garbage collected with it, so a deleted StatefulSet does not
+  # silently take the database with it. No storageClassName: the cluster's default
+  # class is used, which on kind is the local-path provisioner.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: marketplace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi

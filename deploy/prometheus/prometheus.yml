@@ -1,0 +1,53 @@
+# Prometheus scrape configuration for the local stack.
+#
+# Every service exposes /metrics on the same port as its health and readiness
+# probes. One port per service keeps the deployment simple and means a service
+# can never be half-instrumented: if it answers probes, it is scraped.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: marketplace-local
+    env: dev
+
+# Alerting rules, evaluated by this instance. There is no Alertmanager wired up:
+# the rules exist so that the conditions are written down and testable through
+# the Prometheus UI's Alerts page. Routing them somewhere is a deployment
+# decision — pager, chat, or nothing — and does not belong in the repository.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The edge. It owns the RED metrics for everything a client can call.
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:9180"]
+        labels:
+          service: gateway
+          tier: edge
+
+  # Internal gRPC services. Each reports its own server-side metrics; the
+  # gateway's numbers and these are compared during incident review to tell an
+  # edge problem apart from a backend one.
+  - job_name: services
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["auth:9191"]
+        labels: { service: auth, tier: backend }
+      - targets: ["catalog:9192"]
+        labels: { service: catalog, tier: backend }
+      - targets: ["inventory:9193"]
+        labels: { service: inventory, tier: backend }
+      - targets: ["order:9194"]
+        labels: { service: order, tier: backend }
+      - targets: ["payment:9195"]
+        labels: { service: payment, tier: backend }
+      - targets: ["notification:9196"]
+        labels: { service: notification, tier: backend }

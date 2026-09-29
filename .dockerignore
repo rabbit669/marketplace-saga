@@ -1,0 +1,38 @@
+# Build context hygiene: everything here is excluded from `docker build`.
+# Keeping the context small is not cosmetic — it decides how long every
+# `docker compose up --build` takes.
+
+.git
+.gitignore
+.github
+
+# Local build output and coverage
+bin/
+dist/
+cover.html
+coverage.*
+*.coverprofile
+coverage.*.out
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Docs and local tooling do not affect the binaries
+docs/
+*.md
+!README.md
+Makefile
+.golangci.yml
+
+# Local environment and runtime state
+.env
+.env.*
+!.env.example
+tmp/
+*.log
+
+# Deploy manifests are not needed to compile the services
+deploy/k8s/

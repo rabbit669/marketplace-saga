@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package catalog.v1;
+
+import "common/v1/common.proto";
+
+// CatalogService owns the sellable product catalogue: what exists, what it
+// costs, and whether it is currently on sale.
+//
+// It deliberately knows nothing about stock levels — that belongs to the
+// inventory service. The order service calls GetProductsBatch to price a cart,
+// then asks inventory whether the items can actually be shipped.
+service CatalogService {
+  rpc CreateProduct(CreateProductRequest) returns (CreateProductResponse);
+  rpc GetProduct(GetProductRequest) returns (GetProductResponse);
+  rpc GetProductBySKU(GetProductBySKURequest) returns (GetProductBySKUResponse);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  rpc UpdateProduct(UpdateProductRequest) returns (UpdateProductResponse);
+
+  // GetProductsBatch prices an entire cart in one round trip. The order
+  // service uses it to build an immutable price snapshot: prices are copied
+  // into the order, so a later catalogue edit can never change a placed order.
+  rpc GetProductsBatch(GetProductsBatchRequest) returns (GetProductsBatchResponse);
+}
+
+message Product {
+  string id = 1;
+  string sku = 2;
+  string name = 3;
+  string description = 4;
+  common.v1.Money price = 5;
+  string category_id = 6;
+  // Free-form attributes (colour, size, ...). Kept as a map because the
+  // catalogue is intentionally schema-flexible.
+  map<string, string> attributes = 7;
+  bool active = 8;
+  common.v1.AuditInfo audit = 9;
+}
+
+message CreateProductRequest {
+  string sku = 1;
+  string name = 2;
+  string description = 3;
+  common.v1.Money price = 4;
+  string category_id = 5;
+  map<string, string> attributes = 6;
+}
+
+message CreateProductResponse {
+  Product product = 1;
+}
+
+message GetProductRequest {
+  string product_id = 1;
+}
+
+message GetProductResponse {
+  Product product = 1;
+}
+
+message GetProductBySKURequest {
+  string sku = 1;
+}
+
+message GetProductBySKUResponse {
+  Product product = 1;
+}
+
+message ListProductsRequest {
+  common.v1.PageRequest page = 1;
+  // Optional filters; empty means "do not filter on this field".
+  string category_id = 2;
+  string query = 3;
+  bool only_active = 4;
+}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+  common.v1.PageResponse page = 2;
+}
+
+message UpdateProductRequest {
+  string product_id = 1;
+  // Field mask semantics: only fields present in the mask are applied, which
+  // lets a caller clear a field to its zero value deliberately.
+  repeated string update_mask = 2;
+  Product product = 3;
+}
+
+message UpdateProductResponse {
+  Product product = 1;
+}
+
+message GetProductsBatchRequest {
+  // At most 100 ids per call; the server rejects larger batches so that one
+  // caller cannot pin a database connection for an unbounded amount of work.
+  repeated string product_ids = 1;
+}
+
+message GetProductsBatchResponse {
+  // Keyed by product id. Ids that do not exist are simply absent, so callers
+  // must compare len(products) against len(requested) to detect misses.
+  map<string, Product> products = 1;
+}

@@ -1,0 +1,174 @@
+# =============================================================================
+#  auth — identities, credentials, access and refresh tokens.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9091   grpc    the API the gateway calls        AUTH_GRPC_ADDR
+#    9191   health  /healthz /readyz /version /metrics   AUTH_HEALTH_ADDR
+#
+#  Read gateway.yaml first: the probe rationale, the resource-sizing rule and the
+#  securityContext reasoning are written out in full there and are not repeated
+#  verbatim here. What is written here is what is specific to this service.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: auth
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # One replica. The service keeps no state that is not in PostgreSQL or Redis, so
+  # raising this is a one-line change; a second copy of every service would
+  # double the pod count of a local kind cluster for no benefit. The replicas that
+  # availability actually depends on are the gateway (2 + HPA) and order (2).
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: auth
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # The default (maxUnavailable 25%) rounds to "terminate the old pod, then
+      # start the new one" when there is a single replica — a guaranteed gap of a
+      # few seconds in which login fails. Surge-first needs one spare pod and
+      # makes a deploy invisible. minReadySeconds keeps a pod that passes
+      # readiness but is about to fail from taking traffic in that window.
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: auth
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20   # above bootstrap's 15s drain window
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532                  # distroless:nonroot, restated on purpose
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Keep two replicas (of any service) off the same node without making a
+      # second node a scheduling requirement — see gateway.yaml for why this is
+      # ScheduleAnyway rather than DoNotSchedule.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: auth
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: auth
+          image: marketplace/auth:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9091
+              protocol: TCP
+            - name: health
+              containerPort: 9191
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "auth"
+            - name: AUTH_GRPC_ADDR
+              value: ":9091"
+            - name: AUTH_HEALTH_ADDR
+              value: ":9191"
+            # Redis: rate-limit counters and refresh-token state. Same value as
+            # .env.example; the Service in redis.yaml resolves this name.
+            - name: REDIS_ADDR
+              value: "redis:6379"
+            # Tokens: auth signs what the gateway verifies, so both read the
+            # same unprefixed JWT_SECRET. Nothing else out of the Secret is
+            # needed here — least privilege by key, not by envFrom.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: JWT_SECRET
+            - name: AUTH_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: AUTH_DB_DSN
+          # /readyz is the gate, not /healthz: this service is unready until it
+          # can reach the stores it needs, and readiness is the mechanism that
+          # removes it from the gateway's rotation without restarting it.
+          # 5s x 12 = 60s of startup budget covers a cold node, a slow first
+          # connection to PostgreSQL and a Redis that is still loading.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Authentication is cheap (one hash, one token signature) and bursty;
+          # 64MiB is the idle working set with room for concurrent logins, and
+          # 192MiB is 3x that for the GC's live-heap multiple.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: auth
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # ClusterIP: this port is reachable only from inside the namespace, and the
+  # NetworkPolicy in networkpolicy-services.yaml narrows it further to the
+  # gateway's pods.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: auth
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: grpc
+      port: 9091
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 9191
+      targetPort: health
+      protocol: TCP

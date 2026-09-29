@@ -1,0 +1,559 @@
+openapi: 3.1.0
+
+info:
+  title: Marketplace API
+  version: "1.0"
+  description: |
+    The public HTTP surface of the marketplace.
+
+    Everything a client can reach goes through the gateway; the services behind
+    it speak gRPC and are not published. That is why this document describes one
+    API rather than seven.
+
+    ## Two things worth reading before the endpoints
+
+    **Idempotency.** `POST /v1/orders` requires an `Idempotency-Key` header. A
+    retry with the same key returns the original order instead of creating a
+    second one. This is not optional politeness: a client that times out cannot
+    tell whether its request arrived, so retrying is the only safe action, and
+    without a key that retry charges the customer twice.
+
+    **A declined payment is not an error.** `POST /v1/orders` answers `422` with
+    the order in the body and a `failure` object explaining what happened. The
+    order exists and is `cancelled`: the stock was released and no money moved.
+    Reporting it as a `500` would tell the client to retry, which is wrong.
+
+servers:
+  - url: http://localhost:8081
+    description: Local development stack (see GATEWAY_HOST_PORT in .env)
+
+tags:
+  - name: auth
+    description: Registration, login and token refresh. Public.
+  - name: orders
+    description: Checkout and order inspection. Requires a bearer token.
+
+paths:
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account
+      description: |
+        The response never says whether an address was already registered in a
+        way that distinguishes it from a fresh success beyond the status code,
+        because registration is unauthenticated and a clearer answer turns this
+        into an account-enumeration oracle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, full_name]
+              additionalProperties: false
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 12
+                  maxLength: 72
+                  description: |
+                    Twelve characters minimum. Length rather than character
+                    classes: a passphrase beats `P@ssw0rd` and is easier to
+                    remember, while class rules mostly produce `Password1!`.
+                full_name:
+                  type: string
+                  minLength: 1
+      responses:
+        "201":
+          description: The account was created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: An account with this address already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for tokens
+      description: |
+        A wrong password and an unknown address produce the same response, and
+        the same latency. Anything else leaks which addresses are registered.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                client:
+                  type: string
+                  description: Free-form hint recorded for auditing, e.g. "web", "ios".
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: The email or the password is incorrect.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Exchange a refresh token for a new pair
+      description: |
+        Refresh tokens are single use. The response carries a new one and the old
+        one stops working.
+
+        Presenting a token that has already been exchanged is treated as evidence
+        that the chain leaked: the whole family of tokens descended from that
+        login is revoked, which logs out both the thief and the victim. The
+        victim can log in again; the thief cannot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              additionalProperties: false
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: A new token pair. Store the new refresh token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401":
+          description: The refresh token is not valid, has expired, or was already used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders:
+    post:
+      tags: [orders]
+      summary: Place an order
+      description: |
+        Runs the checkout saga: price the cart, reserve stock, authorize payment,
+        capture, commit stock, confirm. Steps before the pivot are compensated in
+        reverse if a later one fails.
+
+        Returns `201` when the saga completed, `200` when the idempotency key
+        replayed an earlier call, and `422` when the saga rolled back — which is
+        the system working, not failing.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 255 }
+          description: |
+            Unique per checkout attempt, stable across retries of it. The header
+            wins over the body field, so a proxy that rewrites bodies cannot
+            change the idempotency semantics.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: The order was placed and confirmed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "200":
+          description: |
+            This key was already used. The body is the original order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: |
+            The checkout was rolled back cleanly: stock released, no money moved.
+            The order is in the body with status `cancelled` and a `failure`
+            object naming the step that failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: |
+            The checkout could not be completed **or** rolled back. Money or stock
+            may be stuck and a person has to resolve it. Distinguishable from 422
+            by the failure code, which is `internal`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "503":
+          description: A dependency was unavailable and the request was not attempted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders/{orderID}:
+    get:
+      tags: [orders]
+      summary: Read an order
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/orders/{orderID}/saga:
+    get:
+      tags: [orders]
+      summary: Read the saga's step history
+      description: |
+        Every step, its status, how many times it was attempted and why it
+        failed. This is what answers "why was this order cancelled?" without
+        reading five services' logs, and it is the endpoint to open first when a
+        checkout looks wrong.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: The saga state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SagaState" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/orders/{orderID}/cancel:
+    post:
+      tags: [orders]
+      summary: Cancel a pending order
+      description: |
+        Only valid while the saga has not confirmed. Cancelling a confirmed order
+        is refused with `422`: that is a refund, a different operation with
+        different rules, and reporting success here would tell the customer their
+        money was coming back when it was not.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: The order, now cancelled or on its way to being.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: The order is already confirmed and cannot be rolled back.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        An access token from `/v1/auth/login`. Short lived; refresh with
+        `/v1/auth/refresh` rather than logging in again.
+
+  parameters:
+    OrderID:
+      name: orderID
+      in: path
+      required: true
+      schema: { type: string }
+      description: The order's identifier, a UUID v7.
+
+  responses:
+    BadRequest:
+      description: The request is malformed or a field is invalid.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing, malformed or expired token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such resource.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: The caller's rate limit was exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                A transport-neutral classification, stable across releases:
+                `invalid_argument`, `not_found`, `already_exists`, `conflict`,
+                `failed_precondition`, `unauthenticated`, `permission_denied`,
+                `resource_exhausted`, `unavailable`, `deadline_exceeded`,
+                `internal`. Branch on this, not on the HTTP status.
+              enum:
+                - invalid_argument
+                - not_found
+                - already_exists
+                - conflict
+                - failed_precondition
+                - unauthenticated
+                - permission_denied
+                - resource_exhausted
+                - unavailable
+                - deadline_exceeded
+                - internal
+            message:
+              type: string
+              description: |
+                Safe to show a user. Internal failures carry the generic text
+                "internal error": implementation detail never crosses the API.
+            request_id:
+              type: string
+              description: Quote this in a support request; it identifies the log line.
+            fields:
+              type: object
+              additionalProperties: { type: string }
+              description: Names the offending input, for a validation failure.
+
+    Money:
+      type: object
+      required: [amount_minor, currency]
+      description: |
+        Integer minor units with a currency, never a decimal number. A JSON
+        number is a double to most clients, and a double cannot represent 0.1
+        exactly — which is how a total computed correctly on the server arrives a
+        cent off.
+      properties:
+        amount_minor:
+          type: integer
+          format: int64
+          description: 12.34 USD is 1234.
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: ISO-4217.
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        roles:
+          type: array
+          items: { type: string, enum: [customer, admin] }
+        email_verified: { type: boolean }
+
+    TokenPair:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token:
+          type: string
+          description: Single use. Present on login and refresh, absent elsewhere.
+        token_type: { type: string, enum: [Bearer] }
+        expires_in:
+          type: integer
+          description: Access token lifetime in seconds.
+        user: { $ref: "#/components/schemas/User" }
+
+    Address:
+      type: object
+      required: [country, city, street, postal_code, recipient]
+      additionalProperties: false
+      properties:
+        country: { type: string, description: ISO-3166-1 alpha-2. }
+        city: { type: string }
+        street: { type: string }
+        postal_code: { type: string }
+        recipient: { type: string }
+
+    CreateOrderRequest:
+      type: object
+      required: [lines, shipping_address, payment_method_token]
+      additionalProperties: false
+      description: |
+        Unknown fields are rejected rather than ignored. A client that misspells
+        a field name would otherwise get a silently different operation, which is
+        the most expensive class of API bug to diagnose.
+      properties:
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [product_id, quantity]
+            additionalProperties: false
+            properties:
+              product_id: { type: string }
+              quantity:
+                type: integer
+                format: int64
+                minimum: 1
+                maximum: 1000
+        shipping_address: { $ref: "#/components/schemas/Address" }
+        payment_method_token:
+          type: string
+          description: |
+            The provider's token for the card. The platform never sees a card
+            number, which is why storing this is not a PCI concern.
+        idempotency_key:
+          type: string
+          description: Fallback for the header. The header wins when both are present.
+
+    OrderLine:
+      type: object
+      properties:
+        product_id: { type: string }
+        sku: { type: string }
+        name: { type: string }
+        quantity: { type: integer, format: int64 }
+        unit_price: { $ref: "#/components/schemas/Money" }
+        line_total: { $ref: "#/components/schemas/Money" }
+
+    CheckoutFailure:
+      type: object
+      description: Present only when the checkout did not complete.
+      properties:
+        code: { type: string }
+        message: { type: string }
+        failed_step:
+          type: string
+          description: |
+            The saga step that triggered the rollback, e.g. `authorize_payment`.
+          enum: [reserve_stock, authorize_payment, capture_payment, commit_stock, confirm_order]
+        retryable:
+          type: boolean
+          description: |
+            Whether the same request could succeed later. A declined card is not
+            retryable; a provider timeout is.
+
+    Order:
+      type: object
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [pending, confirmed, cancelled, failed]
+          description: |
+            `cancelled` means the saga rolled back cleanly — the customer was
+            charged nothing and no stock is held. `failed` means the rollback
+            itself could not be applied and a person is needed. They are not the
+            same outcome and must not be shown the same way.
+        lines:
+          type: array
+          items: { $ref: "#/components/schemas/OrderLine" }
+        total: { $ref: "#/components/schemas/Money" }
+        shipping_address: { $ref: "#/components/schemas/Address" }
+        payment_id: { type: string }
+        reservation_id: { type: string }
+        saga_status:
+          type: string
+          enum: [running, completed, compensating, compensated, failed]
+        idempotent_replay:
+          type: boolean
+          description: True when this response describes an earlier call's order.
+        failure: { $ref: "#/components/schemas/CheckoutFailure" }
+
+    SagaState:
+      type: object
+      properties:
+        order_id: { type: string }
+        status:
+          type: string
+          enum: [running, completed, compensating, compensated, failed]
+        attempts: { type: integer }
+        last_error: { type: string }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status:
+                type: string
+                enum: [pending, completed, failed, compensated, compensation_failed]
+              attempts: { type: integer }
+              error: { type: string }
+              compensated:
+                type: boolean
+                description: |
+                  Whether a compensation was applied, independently of status. A
+                  step that failed and was still compensated — because its
+                  outcome was unknown — keeps status `failed` so the operator can
+                  see what triggered the rollback.
+              started_at: { type: string, format: date-time }
+              finished_at: { type: string, format: date-time }

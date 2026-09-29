@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package payment.v1;
+
+import "common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// PaymentService is a stand-in for a real payment provider (Stripe, Adyen, ...).
+//
+// Two properties matter for the saga and are modelled explicitly:
+//
+//  1. AuthorizePayment is idempotent on idempotency_key. Providers require
+//     this, and so do we: a network timeout during checkout must not charge
+//     the customer twice when the saga retries.
+//  2. The provider can decline. In dev the decline is simulated with a
+//     configurable rate, so the compensation path is exercised by real traffic
+//     rather than only by tests.
+service PaymentService {
+  rpc AuthorizePayment(AuthorizePaymentRequest) returns (AuthorizePaymentResponse);
+  rpc CapturePayment(CapturePaymentRequest) returns (CapturePaymentResponse);
+  // VoidPayment cancels an authorization that was never captured. It is the
+  // checkout saga's compensation for an authorization, and it is deliberately
+  // distinct from RefundPayment: a void releases a hold that never became a
+  // charge, while a refund returns money that was actually taken. Conflating
+  // them would make a rolled-back checkout look like a refunded one.
+  rpc VoidPayment(VoidPaymentRequest) returns (VoidPaymentResponse);
+  rpc RefundPayment(RefundPaymentRequest) returns (RefundPaymentResponse);
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+}
+
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_AUTHORIZED = 1; // funds held, not yet captured (compensatable)
+  PAYMENT_STATUS_CAPTURED = 2;   // funds taken (terminal)
+  PAYMENT_STATUS_DECLINED = 3;   // provider refused (terminal)
+  PAYMENT_STATUS_REFUNDED = 4;   // captured funds returned (terminal)
+  PAYMENT_STATUS_VOIDED = 5;     // authorization cancelled before capture (terminal)
+}
+
+// DeclinedReason tells the saga whether a decline is worth retrying. A
+// "insufficient_funds" decline will not succeed on retry; "provider_timeout"
+// might. Retrying the wrong class of failure amplifies outages.
+enum DeclinedReason {
+  DECLINED_REASON_UNSPECIFIED = 0;
+  DECLINED_REASON_INSUFFICIENT_FUNDS = 1; // permanent
+  DECLINED_REASON_CARD_EXPIRED = 2;       // permanent
+  DECLINED_REASON_FRAUD_SUSPECTED = 3;    // permanent
+  DECLINED_REASON_PROVIDER_TIMEOUT = 4;   // transient, retryable
+  DECLINED_REASON_PROVIDER_UNAVAILABLE = 5; // transient, retryable
+}
+
+message Payment {
+  string id = 1;
+  string order_id = 2;
+  common.v1.Money amount = 3;
+  PaymentStatus status = 4;
+  DeclinedReason declined_reason = 5;
+  // Provider-side reference, useful when reconciling with a real PSP.
+  string provider_reference = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message AuthorizePaymentRequest {
+  string order_id = 1;
+  common.v1.Money amount = 2;
+  // Required. Two calls with the same key return the same payment.
+  string idempotency_key = 3;
+  // Opaque payment method token; a real integration would use a provider token.
+  string payment_method_token = 4;
+}
+
+message AuthorizePaymentResponse {
+  Payment payment = 1;
+  // True when this response replays a previously stored result.
+  bool idempotent_replay = 2;
+  // retryable reports whether a decline is transient and therefore worth
+  // another attempt. It is false for an approval.
+  //
+  // This is on the wire rather than derived by each caller on purpose. Which
+  // declines are retryable is a fact about the provider, and only this service
+  // knows it. A consumer that re-derived the rule from declined_reason would be
+  // duplicating a business policy in a second place, where it would silently
+  // drift the first time a provider changed its behaviour.
+  bool retryable = 3;
+}
+
+message CapturePaymentRequest {
+  string payment_id = 1;
+  string idempotency_key = 2;
+}
+
+message CapturePaymentResponse {
+  Payment payment = 1;
+}
+
+message VoidPaymentRequest {
+  string payment_id = 1;
+  // Recorded for the audit trail, e.g. "checkout_failed:authorize_payment".
+  string reason = 2;
+}
+
+message VoidPaymentResponse {
+  // Absent when there was nothing to void — the payment never existed, or the
+  // provider had already declined it. A compensation treats that as success,
+  // because it runs precisely when the caller does not know whether the forward
+  // step applied.
+  Payment payment = 1;
+}
+
+message RefundPaymentRequest {
+  string payment_id = 1;
+  // Partial refunds are allowed; zero means "refund the full captured amount".
+  common.v1.Money amount = 2;
+  string reason = 3;
+  string idempotency_key = 4;
+}
+
+message RefundPaymentResponse {
+  Payment payment = 1;
+}
+
+message GetPaymentRequest {
+  string payment_id = 1;
+  // Lookup by order id is used by the saga recovery worker when it does not
+  // know whether an earlier authorize attempt actually landed.
+  string order_id = 2;
+}
+
+message GetPaymentResponse {
+  Payment payment = 1;
+}

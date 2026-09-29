@@ -1,0 +1,153 @@
+# =============================================================================
+#  notification — the Kafka consumer that tells customers what happened.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9196   health  /healthz /readyz /version /metrics   NOTIFICATION_HEALTH_ADDR
+#
+#  Note what is missing: there is no gRPC port and no HTTP port. This service has
+#  no inbound API — it is a consumer, and its only inputs are Kafka topics — so
+#  its Service publishes the health port alone. That Service still earns its keep:
+#  it is the stable name Prometheus scrapes and the name that appears in
+#  `kubectl get endpoints` when someone asks "is the consumer actually running".
+#
+#  Cross-check note (see deploy/k8s/README.md): deploy/docker-compose.yml gives
+#  this service NOTIFICATION_DB_DSN, which is the name used below, while the
+#  consumer currently looks up the shared DB_DSN. It therefore starts with
+#  in-memory deduplication and logs a warning about it. The manifest follows
+#  compose, because compose is the description of the stack.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: notification
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notification
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notification
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      # Longer than the other services: this one holds a consumer-group
+      # membership, and a clean shutdown commits offsets and leaves the group
+      # before the group coordinator notices a missing member and rebalances.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: notification
+          image: marketplace/notification:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 9196
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "notification"
+            - name: NOTIFICATION_HEALTH_ADDR
+              value: ":9196"
+            # Kafka: this is the only service whose readiness has to wait for the
+            # broker, and the only one whose failure mode is "events pile up
+            # instead of being delivered" rather than "a request fails".
+            - name: NOTIFICATION_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: NOTIFICATION_DB_DSN
+          # A consumer is Ready when it can serve /readyz, not when it has a
+          # partition assignment — assignment is deliberately not part of
+          # readiness, or a rebalance would take every consumer out of rotation
+          # at once. 5s x 12 = 60s covers a broker that is still starting.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness is lenient here on purpose: a consumer that is behind on its
+          # partition is working, not wedged, and restarting it would only add a
+          # rebalance to the backlog.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 4
+          # The smallest footprint in the stack: it consumes, it does not serve.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: notification
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: notification
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    # The health port only — there is no business port to publish. Prometheus
+    # scrapes /metrics here and the kubelet probes /readyz here.
+    - name: health
+      port: 9196
+      targetPort: health
+      protocol: TCP

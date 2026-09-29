@@ -1,0 +1,180 @@
+# Prometheus alerting rules.
+#
+# Every rule here is written against a metric the services actually emit, and
+# every one has a `for` clause. An alert without a duration fires on a single
+# scrape — a transient blip — and a channel full of blips is a channel nobody
+# reads, which is how a real outage gets missed.
+#
+# The thresholds are reasoned rather than measured. They are starting points for
+# a system at this size, and the honest way to tune them is to run the k6 load
+# test, watch which panels move first, and set the limit just above the normal
+# range that produced.
+
+groups:
+  # ---------------------------------------------------------------- edge
+  - name: gateway
+    interval: 30s
+    rules:
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(http_server_requests_total{service="gateway", status=~"5.."}[5m]))
+            /
+          sum(rate(http_server_requests_total{service="gateway"}[5m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "More than 5% of gateway requests are failing"
+          description: |
+            The edge is returning 5xx for {{ $value | humanizePercentage }} of requests.
+            A 4xx is not counted: a declined card arrives as 422 and is the system
+            working, not failing.
+          runbook: |
+            1. Check which routes: `sum by (route) (rate(http_server_requests_total{status=~"5.."}[5m]))`
+            2. Check whether a dependency is down: the gRPC error-ratio panel
+            3. If one dependency dominates, its circuit breaker should already be open
+
+      - alert: GatewaySlowCheckout
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_duration_seconds_bucket{service="gateway", route="POST /v1/orders"}[5m]))
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "p95 checkout latency above 1.5s"
+          description: |
+            Checkout is taking {{ $value }}s at p95. A checkout is a five-step
+            saga across four services, so a regression in any of them shows up
+            here first.
+          runbook: |
+            1. Open the gRPC p95 panel and find which method moved
+            2. Open a slow trace in Jaeger — the saga record names the step
+            3. A saga step that is slow to a dependency is usually the answer
+
+  # --------------------------------------------------------------- sagas
+  - name: checkout-saga
+    interval: 30s
+    rules:
+      - alert: SagaNeedsHumanIntervention
+        expr: increase(marketplace_events_total{kind="saga_checkout", outcome="failed"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: order
+        annotations:
+          summary: "A checkout could not be rolled back"
+          description: |
+            {{ $value }} checkout(s) ended in the failed state, which means a
+            compensation could not be applied: stock is still held, or money is
+            in limbo. This is the one saga outcome that needs a person.
+          runbook: |
+            1. Find the orders: `curl -H "Authorization: Bearer $TOKEN" $GATEWAY/v1/orders/<id>/saga`
+            2. The failed step and its error are in the response
+            3. Once the blocking dependency is healthy, `RetrySaga` finishes the rollback
+
+      - alert: NoCheckoutTraffic
+        expr: |
+          sum(rate(http_server_requests_total{service="gateway", route="POST /v1/orders"}[10m])) == 0
+            and
+          sum(rate(http_server_requests_total{service="gateway"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "The gateway is serving requests but no checkout has been attempted"
+          description: |
+            Other routes are busy and checkout is silent, which is more likely to
+            be a broken route than a quiet shop.
+
+  # ----------------------------------------------------------- event pipeline
+  - name: events
+    interval: 30s
+    rules:
+      - alert: OutboxBacklogGrowing
+        expr: max_over_time(marketplace_state{kind="outbox_pending"}[10m]) > 500
+        for: 10m
+        labels:
+          severity: critical
+          component: order
+        annotations:
+          summary: "The outbox has {{ $value }} unpublished events"
+          description: |
+            Events are committed to the database but not reaching Kafka, so every
+            notification behind them is late. The poller is stuck or the broker
+            is unreachable.
+          runbook: |
+            1. Check the broker: `docker compose logs kafka`
+            2. Check the poller: `docker compose logs order | grep outbox`
+            3. Events are not lost — they are in the table and will be published
+               when the broker returns. Delivery is at-least-once, so a consumer
+               may see duplicates; it deduplicates by event id.
+
+      - alert: OutboxBacklogNotDraining
+        expr: |
+          marketplace_state{kind="outbox_pending"} > 0
+            and
+          deriv(marketplace_state{kind="outbox_pending"}[15m]) >= 0
+        for: 15m
+        labels:
+          severity: warning
+          component: order
+        annotations:
+          summary: "The outbox backlog is not shrinking"
+          description: |
+            The backlog is non-zero and flat. A publisher working through a
+            backlog would show a negative derivative; flat means it is not
+            publishing at all.
+
+  # ------------------------------------------------------------ dependencies
+  - name: services
+    interval: 30s
+    rules:
+      - alert: HighDependencyErrorRate
+        expr: |
+          sum by (service) (rate(grpc_server_requests_total{code!="OK", code!="FailedPrecondition"}[5m]))
+            /
+          sum by (service) (rate(grpc_server_requests_total[5m]))
+            > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          component: "{{ $labels.service }}"
+        annotations:
+          summary: "{{ $labels.service }} is failing 10% of its gRPC calls"
+          description: |
+            FailedPrecondition is excluded on purpose: it is how a declined card
+            is reported, and a shop where cards are sometimes declined is not
+            an incident. Every other error code is.
+
+      - alert: ServiceNotScraped
+        expr: up{job="services"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          component: "{{ $labels.service }}"
+        annotations:
+          summary: "{{ $labels.service }} cannot be scraped"
+          description: |
+            Either the service is down, or it is up and its /metrics endpoint is
+            broken. Both are worth knowing: the second is how a service becomes
+            invisible without anyone noticing.
+
+      - alert: GoroutineLeak
+        expr: |
+          deriv(go_goroutines[30m]) > 1
+        for: 30m
+        labels:
+          severity: warning
+          component: "{{ $labels.service }}"
+        annotations:
+          summary: "{{ $labels.service }} is accumulating goroutines"
+          description: |
+            The goroutine count has risen steadily for half an hour. Load does
+            not do this — a busy service plateaus. A sustained climb is a stuck
+            worker, an unbounded retry, or a context that is never cancelled.

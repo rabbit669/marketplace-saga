@@ -1,0 +1,85 @@
+# =============================================================================
+#  HorizontalPodAutoscaler for the gateway.
+#
+#  Only the gateway has one, and the reasoning is worth stating: it is the only
+#  component in the stack whose load is a function of customer traffic rather than
+#  of a queue, and the only one that is on the critical path for *every* request.
+#  The backend services see traffic through it, so scaling them ahead of the edge
+#  would only add idle pods; the order service's real backlog control is the outbox
+#  poller and the saga recovery worker, not a replica count.
+#
+#  CPUs, not memory, and not requests per second:
+#    * the gateway's work is CPU-bound (JWT verification, JSON encoding, rate-limit
+#      arithmetic), so CPU utilization tracks load directly;
+#    * a memory target is a trap for a Go service: the runtime holds on to freed
+#      heap, so memory utilization effectively never comes back down and the HPA
+#      would scale up and never in. If a memory signal is wanted later, it has to
+#      be a working-set metric with a matching scale-down policy;
+#    * a requests-per-second metric would need a metrics adapter and a prometheus
+#      adapter on top of that; CPU is available out of the box.
+#
+#  It requires the resource *requests* on the container (100m, see gateway.yaml):
+#  utilization is a percentage of the request, so without a request the HPA reports
+#  <unknown> and does nothing. It also requires a metrics-server, which kind does
+#  not ship — locally this object is inert and the Deployment stays at its 2
+#  replicas, which is a perfectly good development configuration.
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: marketplace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  # Two, never one. The gateway is the only ingress point: with a single replica,
+  # a node drain or a rolling deploy has nowhere to move the traffic, and the
+  # PodDisruptionBudget in pdb.yaml (minAvailable 1) would block the drain instead
+  # of protecting it. In a real cluster this would be 3, spread over three zones.
+  minReplicas: 2
+  # Six is a local-cluster ceiling: each replica is a full container, and a kind
+  # node has to run this plus the other twelve workloads. In production the ceiling
+  # comes from a load test, not from the size of a laptop.
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 70%, not 90%. The point of scaling out is to add capacity *before*
+          # requests get slow; a target that close to saturation means the HPA
+          # reacts only once latency has already degraded, and by then the extra
+          # replicas are starting cold. It also leaves room for the burst between a
+          # metrics sample and the new pod becoming Ready.
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # No stabilization on the way up: traffic spikes are the case this exists
+      # for, and delaying a scale-up to avoid flapping trades latency for pod count.
+      stabilizationWindowSeconds: 0
+      policies:
+        # Double, or add two pods — whichever is larger — at most every 30s, which
+        # is fast enough to track a spike and slow enough not to overshoot into a
+        # fleet that then has to be scaled back down.
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Five minutes of quiet before removing a replica. Scale-down is the direction
+      # that hurts: a replica that is removed and immediately needed costs a cold
+      # start, and Go services need a moment to drain in-flight requests.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

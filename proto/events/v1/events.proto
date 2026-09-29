@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package events.v1;
+
+import "common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// Domain events published to Kafka.
+//
+// Every message on the wire is an Envelope. The envelope carries the routing
+// and tracing metadata; the payload carries the facts. Keeping them separate
+// means consumers can dispatch, deduplicate and trace without deserialising the
+// business payload first.
+message Envelope {
+  // Stable id of this event. Consumers persist it to deduplicate: delivery is
+  // at-least-once, so the same event will arrive more than once under retry.
+  string event_id = 1;
+  // Fully-qualified type name, e.g. "order.created". Used for routing.
+  string event_type = 2;
+  // Set when this event belongs to a saga, letting consumers order events.
+  string saga_id = 3;
+  // Correlation id of the business operation that produced the event.
+  string correlation_id = 4;
+  // W3C traceparent, copied from the outbox row so the consumer can join the
+  // original trace instead of starting a disconnected one.
+  string trace_parent = 5;
+  // Schema version of the payload, so consumers can stay compatible.
+  int32 schema_version = 6;
+  google.protobuf.Timestamp occurred_at = 7;
+
+  oneof payload {
+    OrderCreated order_created = 10;
+    OrderConfirmed order_confirmed = 11;
+    OrderCancelled order_cancelled = 12;
+    StockReserved stock_reserved = 13;
+    StockReleased stock_released = 14;
+    PaymentAuthorized payment_authorized = 15;
+    PaymentDeclined payment_declined = 16;
+    PaymentRefunded payment_refunded = 17;
+  }
+}
+
+message OrderLinePayload {
+  string product_id = 1;
+  string sku = 2;
+  int64 quantity = 3;
+  common.v1.Money unit_price = 4;
+}
+
+message OrderCreated {
+  string order_id = 1;
+  string customer_id = 2;
+  repeated OrderLinePayload lines = 3;
+  common.v1.Money total = 4;
+}
+
+message OrderConfirmed {
+  string order_id = 1;
+  string customer_id = 2;
+  string payment_id = 3;
+  common.v1.Money total = 4;
+}
+
+message OrderCancelled {
+  string order_id = 1;
+  string customer_id = 2;
+  // Which step failed and triggered compensation.
+  string failed_step = 3;
+  string reason = 4;
+}
+
+message StockReserved {
+  string order_id = 1;
+  string reservation_id = 2;
+  repeated OrderLinePayload lines = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message StockReleased {
+  string order_id = 1;
+  string reservation_id = 2;
+  string reason = 3;
+}
+
+message PaymentAuthorized {
+  string order_id = 1;
+  string payment_id = 2;
+  common.v1.Money amount = 3;
+}
+
+message PaymentDeclined {
+  string order_id = 1;
+  string payment_id = 2;
+  // Mirrors payment.v1.DeclinedReason; duplicated as an int so that the events
+  // package does not depend on the payment package.
+  int32 declined_reason = 3;
+  string message = 4;
+  // Whether the saga should retry this step at all.
+  bool retryable = 5;
+}
+
+message PaymentRefunded {
+  string order_id = 1;
+  string payment_id = 2;
+  common.v1.Money amount = 3;
+}

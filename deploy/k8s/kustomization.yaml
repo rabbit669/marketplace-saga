@@ -1,0 +1,88 @@
+# =============================================================================
+#  Entry point: `kubectl apply -k deploy/k8s` (which is what `make k8s-apply`
+#  runs), and `kubectl delete -k deploy/k8s` for `make k8s-delete`.
+#
+#  A reviewer can read the whole deployment in this directory:
+#
+#    namespace.yaml                 the namespace and its Pod Security level
+#    configmap.yaml                 the shared, non-secret half of .env.example
+#    secret.yaml                    placeholders that must be replaced
+#    <service>.yaml                 x7: Deployment + Service, one file per service
+#    postgres.yaml redis.yaml kafka.yaml
+#    jaeger.yaml prometheus.yaml grafana.yaml
+#                                   the six dependencies, with a PVC wherever
+#                                   state actually lives
+#    hpa.yaml pdb.yaml              the gateway's autoscaler, two disruption budgets
+#    networkpolicy-*.yaml           deny by default, then one flow at a time
+#
+#  Everything is listed explicitly rather than globbed. `kustomize` would accept a
+#  directory, but an explicit list makes a new file a reviewable diff and makes it
+#  impossible to add a manifest that nobody notices is deployed.
+#
+#  Every manifest also sets metadata.namespace itself, and this file does not use the
+#  `namespace:` transformer. That is deliberate duplication: it means any single file
+#  can be read, applied and deleted on its own (`kubectl apply -f deploy/k8s/order.yaml`)
+#  without kustomize in the loop, which is how these get debugged at 2am.
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # --- namespace and configuration
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+
+  # --- the seven services, one file each
+  - gateway.yaml
+  - auth.yaml
+  - catalog.yaml
+  - inventory.yaml
+  - order.yaml
+  - payment.yaml
+  - notification.yaml
+
+  # --- the dependencies, stateful ones as StatefulSets with PVCs
+  - postgres.yaml
+  - redis.yaml
+  - kafka.yaml
+  - jaeger.yaml
+  - prometheus.yaml
+  - grafana.yaml
+
+  # --- availability and blast radius
+  - hpa.yaml
+  - pdb.yaml
+
+  # --- who may talk to whom
+  - networkpolicy-baseline.yaml
+  - networkpolicy-services.yaml
+  - networkpolicy-infra.yaml
+
+# The seven images built by deploy/docker/Dockerfile (`--build-arg SERVICE=<name>`).
+#
+# The Deployments already name `marketplace/<service>:dev` so that a raw
+# `kubectl apply -f` of a single file works without kustomize. This transformer is
+# the single place to change all seven at once — for a released build:
+#
+#   kustomize edit set image marketplace/gateway=registry.example.com/marketplace/gateway:$(git rev-parse --short HEAD)
+#
+# or by editing the tags below. `dev` is used rather than `latest` on purpose:
+# `latest` would make the kubelet try to pull on every start (imagePullPolicy
+# resolves to Always for that tag), which on a kind cluster means pull failures for
+# an image that only exists locally.
+images:
+  - name: marketplace/gateway
+    newTag: dev
+  - name: marketplace/auth
+    newTag: dev
+  - name: marketplace/catalog
+    newTag: dev
+  - name: marketplace/inventory
+    newTag: dev
+  - name: marketplace/order
+    newTag: dev
+  - name: marketplace/payment
+    newTag: dev
+  - name: marketplace/notification
+    newTag: dev

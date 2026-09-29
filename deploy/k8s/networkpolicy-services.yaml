@@ -1,0 +1,449 @@
+# =============================================================================
+#  One policy per application service.
+#
+#  Every object here has both directions, and they answer two different questions:
+#
+#    ingress = who may call this service, on which port
+#    egress  = what this service may call, on which port
+#
+#  Both have to be right. An ingress rule without the matching egress rule on the
+#  caller's side produces a connection that is allowed to arrive and never leaves.
+#
+#  The flows, in one table (a reviewer can check this against
+#  deploy/docker-compose.yml's depends_on blocks, which describe the same graph):
+#
+#    caller     -> callee      port   why
+#    ---------------------------------------------------------------------------
+#    outside    -> gateway     8080   the only externally reachable business port
+#    gateway    -> auth        9091   login, token refresh
+#    gateway    -> order       9094   checkout, order lookup
+#    gateway    -> catalog     9092   product browsing
+#    order      -> catalog     9092   price snapshot, the saga's first step
+#    order      -> inventory   9093   reserve and release stock
+#    order      -> payment     9095   authorize and void
+#    auth       -> postgres    5432   identities, credentials, refresh tokens
+#    catalog    -> postgres    5432   products
+#    inventory  -> postgres    5432   stock and reservations
+#    order      -> postgres    5432   orders, saga state, outbox
+#    payment    -> postgres    5432   payments, idempotency records
+#    notificatn -> postgres    5432   processed event ids (deduplication)
+#    auth       -> redis       6379   rate-limit counters, refresh-token state
+#    catalog    -> redis       6379   cache
+#    catalog    -> kafka       9092   product events
+#    inventory  -> kafka       9092   reservation events
+#    order      -> kafka       9092   outbox publisher
+#    payment    -> kafka       9092   payment events
+#    notificatn -> kafka       9092   consumes order.confirmed / order.cancelled
+#    prometheus -> everyone    health scrapes /metrics
+#    everyone   -> jaeger      4317   span export (in networkpolicy-baseline.yaml)
+#
+#  Two things every service in this file is allowed to receive, and why they are
+#  not a hole:
+#
+#    * the health port (9180-9196) is reachable from any source. The kubelet dials
+#      /readyz from the *node's* IP: a node is not a pod and has no pod identity, so
+#      it cannot be expressed as a podSelector, and a rule that excludes it means
+#      every probe fails and no pod ever becomes Ready. Prometheus needs the same
+#      port for /metrics. What keeps this honest is that the port serves only
+#      /healthz, /readyz, /version and /metrics, and that the Service is a
+#      ClusterIP — nothing publishes it outside the cluster.
+#    * DNS is allowed to every pod by networkpolicy-baseline.yaml, because every
+#      dependency in the table above is reached by name.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  gateway — the edge. The only service with an ingress rule that is not scoped to
+#  other pods, because it is the only service whose callers are customers.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: the outside world -> gateway:8080. This is the one rule in the
+    # whole directory that admits traffic from outside the cluster. 0.0.0.0/0 is
+    # how a NetworkPolicy says "any source address"; the NodePort in gateway.yaml
+    # (and, in a real cluster, an Ingress or LoadBalancer in front of it) is what
+    # turns that into "reachable from the internet".
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 8080
+    # FLOW ENABLED: kubelet probes and the Prometheus scrape -> gateway:9180.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9180
+  egress:
+    # FLOW ENABLED: gateway -> auth:9091 (login, refresh, token verification calls).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: auth
+      ports:
+        - protocol: TCP
+          port: 9091
+    # FLOW ENABLED: gateway -> order:9094 (checkout and order reads).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+      ports:
+        - protocol: TCP
+          port: 9094
+    # FLOW ENABLED: gateway -> catalog:9092. This rule exists because the gateway
+    # is *configured* with a catalog target (CATALOG_GRPC_TARGET, in the shared
+    # ConfigMap and in .env.example). If that target is ever actually dialled and
+    # the rule were missing, the failure would look like a catalog outage.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+# -----------------------------------------------------------------------------
+#  auth
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: auth
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: gateway -> auth:9091, and nothing else. No backend service
+    # calls auth: the order saga authenticates the customer once, at the edge.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 9091
+    # FLOW ENABLED: kubelet probes + Prometheus -> auth:9191.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9191
+  egress:
+    # FLOW ENABLED: auth -> postgres:5432 (auth_db).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # FLOW ENABLED: auth -> redis:6379 (rate-limit counters, refresh-token state).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# -----------------------------------------------------------------------------
+#  catalog — the only service with two business callers, which is the point of
+#  writing the ingress list out rather than copying the previous policy.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: catalog
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: catalog
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: gateway -> catalog:9092 (product browsing) *and*
+    # order -> catalog:9092 (the price snapshot the saga prices a checkout with).
+    # Both callers in one rule: the port and the permission are identical, and two
+    # rules would suggest the two flows differ.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+      ports:
+        - protocol: TCP
+          port: 9092
+    # FLOW ENABLED: kubelet probes + Prometheus -> catalog:9192.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9192
+  egress:
+    # FLOW ENABLED: catalog -> postgres:5432 (catalog_db).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # FLOW ENABLED: catalog -> redis:6379.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # FLOW ENABLED: catalog -> kafka:9092 (product events).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+# -----------------------------------------------------------------------------
+#  inventory — reservations are a consequence of a checkout, never a user action,
+#  so the order service is its only caller.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inventory
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: inventory
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: order -> inventory:9093 (reserve, release, confirm).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+      ports:
+        - protocol: TCP
+          port: 9093
+    # FLOW ENABLED: kubelet probes + Prometheus -> inventory:9193.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9193
+  egress:
+    # FLOW ENABLED: inventory -> postgres:5432 (inventory_db).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # FLOW ENABLED: inventory -> kafka:9092 (reservation events).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+# -----------------------------------------------------------------------------
+#  order — the saga orchestrator, and the busiest egress list in the stack: three
+#  services, the database and the broker, each on exactly one port.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: order
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: gateway -> order:9094. The saga is not reachable from any other
+    # service: a backend that could start a checkout directly would be able to
+    # bypass the edge's authentication and idempotency handling.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 9094
+    # FLOW ENABLED: kubelet probes + Prometheus -> order:9194.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9194
+  egress:
+    # FLOW ENABLED: order -> postgres:5432 (order_db: orders, saga state, outbox).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # FLOW ENABLED: order -> kafka:9092 (the outbox poller publishes here).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # FLOW ENABLED: order -> catalog:9092 (the price snapshot).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+      ports:
+        - protocol: TCP
+          port: 9092
+    # FLOW ENABLED: order -> inventory:9093 (reserve; compensate by releasing).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inventory
+      ports:
+        - protocol: TCP
+          port: 9093
+    # FLOW ENABLED: order -> payment:9095 (authorize; compensate by voiding).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment
+      ports:
+        - protocol: TCP
+          port: 9095
+---
+# -----------------------------------------------------------------------------
+#  payment
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payment
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: order -> payment:9095 (authorize, capture, void).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+      ports:
+        - protocol: TCP
+          port: 9095
+    # FLOW ENABLED: kubelet probes + Prometheus -> payment:9195.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9195
+  egress:
+    # FLOW ENABLED: payment -> postgres:5432 (payments and idempotency records).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # FLOW ENABLED: payment -> kafka:9092 (payment events).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+# -----------------------------------------------------------------------------
+#  notification — no business ingress at all, because it has no inbound API.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notification
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: notification
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: kubelet probes + Prometheus -> notification:9196. This is the
+    # entire ingress list: nothing in the cluster may call this service, because it
+    # has nothing to call. Its inputs are Kafka topics.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9196
+  egress:
+    # FLOW ENABLED: notification -> kafka:9092 (it is the consumer).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # FLOW ENABLED: notification -> postgres:5432 (processed event ids, so that a
+    # redelivery does not send the same email twice).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432

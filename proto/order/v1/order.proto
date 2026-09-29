@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package order.v1;
+
+import "common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// OrderService owns the checkout saga.
+//
+// CreateOrder does not simply insert a row: it starts an orchestrated saga that
+// walks through stock reservation and payment authorization, compensating every
+// completed step if a later one fails. The order row and the saga row are
+// written in the same transaction, which is what makes the saga recoverable
+// after a crash between steps.
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // Cancelling is asynchronous by nature (it may need to refund and release
+  // stock), so the caller polls the saga instead of blocking on it.
+  rpc GetSagaState(GetSagaStateRequest) returns (GetSagaStateResponse);
+
+  // Operator escape hatch: nudge a saga that the recovery worker gave up on.
+  rpc RetrySaga(RetrySagaRequest) returns (RetrySagaResponse);
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;    // saga is still running
+  ORDER_STATUS_CONFIRMED = 2;  // paid and stock committed (terminal)
+  ORDER_STATUS_CANCELLED = 3;  // compensated back to a clean state (terminal)
+  ORDER_STATUS_FAILED = 4;     // compensation itself failed; needs a human
+}
+
+enum SagaStatus {
+  SAGA_STATUS_UNSPECIFIED = 0;
+  SAGA_STATUS_RUNNING = 1;
+  SAGA_STATUS_COMPLETED = 2;
+  SAGA_STATUS_COMPENSATING = 3;
+  SAGA_STATUS_COMPENSATED = 4;
+  SAGA_STATUS_FAILED = 5;
+}
+
+// StepStatus is the state of one step, which is a different question from the
+// state of the saga. A step can have failed while the saga went on to roll back
+// cleanly, and collapsing the two would lose the answer to "what actually broke?".
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;
+  STEP_STATUS_PENDING = 1;
+  STEP_STATUS_COMPLETED = 2;
+  STEP_STATUS_FAILED = 3;
+  STEP_STATUS_COMPENSATED = 4;
+  STEP_STATUS_COMPENSATION_FAILED = 5;
+}
+
+// SagaStep is the durable record of one step attempt. The pair
+// (step name, attempt) makes the log replayable, which is how the recovery
+// worker decides what still needs compensating after a restart.
+message SagaStep {
+  string name = 1; // "reserve_stock", "authorize_payment", ...
+  StepStatus status = 2;
+  int32 attempt = 3;
+  string error = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp finished_at = 6;
+  // compensated reports whether a compensation was applied to this step,
+  // independently of status. A step that failed and was still compensated —
+  // because its outcome was unknown — keeps status FAILED so the operator can
+  // see what triggered the rollback, while this records that cleanup happened.
+  bool compensated = 7;
+}
+
+message OrderLine {
+  string product_id = 1;
+  string sku = 2;
+  string name = 3;
+  int64 quantity = 4;
+  // Price captured at checkout time. Later catalogue changes must not alter
+  // the amount a customer already agreed to pay.
+  common.v1.Money unit_price = 5;
+  common.v1.Money line_total = 6;
+}
+
+message Order {
+  string id = 1;
+  string customer_id = 2;
+  OrderStatus status = 3;
+  repeated OrderLine lines = 4;
+  common.v1.Money total = 5;
+  common.v1.Address shipping_address = 6;
+  string payment_id = 7;
+  string reservation_id = 8;
+  common.v1.AuditInfo audit = 9;
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated OrderLineRequest lines = 2;
+  common.v1.Address shipping_address = 3;
+  // Required. A retried checkout with the same key returns the original order
+  // instead of placing a second one — the single most common double-charge bug.
+  string idempotency_key = 4;
+  string payment_method_token = 5;
+}
+
+message OrderLineRequest {
+  string product_id = 1;
+  int64 quantity = 2;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+  // False while the saga is still running; poll GetSagaState for progress.
+  bool saga_completed = 2;
+  SagaStatus saga_status = 3;
+  // True when this call replayed an existing order for the same idempotency key.
+  bool idempotent_replay = 4;
+  // failure explains why the checkout did not complete, and is absent on
+  // success.
+  //
+  // A rolled-back checkout is reported here rather than as a gRPC error, for a
+  // reason that is easy to get wrong: gRPC has no partial success. When a
+  // handler returns both a response and a non-OK status, the status wins and the
+  // response is discarded — so the caller would never see the order, its final
+  // status, or the reason. Every client would then have to guess what happened
+  // from a status code alone.
+  CheckoutFailure failure = 5;
+}
+
+// CheckoutFailure describes a checkout that did not complete.
+message CheckoutFailure {
+  // code is the transport-neutral classification, e.g. "failed_precondition"
+  // for a declined card or "internal" when compensation itself could not be
+  // applied. The HTTP layer maps it to a status code.
+  string code = 1;
+  // message is safe to show the customer.
+  string message = 2;
+  // failed_step names the step that triggered the rollback, e.g.
+  // "authorize_payment". It is what makes an incident readable.
+  string failed_step = 3;
+  // retryable says whether the same request could succeed later.
+  bool retryable = 4;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  string customer_id = 1;
+  common.v1.PageRequest page = 2;
+  OrderStatus status_filter = 3;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+  common.v1.PageResponse page = 2;
+}
+
+message CancelOrderRequest {
+  string order_id = 1;
+  string reason = 2;
+}
+
+message CancelOrderResponse {
+  Order order = 1;
+  SagaStatus saga_status = 2;
+}
+
+message GetSagaStateRequest {
+  string order_id = 1;
+}
+
+message GetSagaStateResponse {
+  string saga_id = 1;
+  string order_id = 2;
+  SagaStatus status = 3;
+  repeated SagaStep steps = 4;
+  int32 attempts = 5;
+  string last_error = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message RetrySagaRequest {
+  string order_id = 1;
+}
+
+message RetrySagaResponse {
+  SagaStatus status = 1;
+}

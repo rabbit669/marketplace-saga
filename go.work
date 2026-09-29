@@ -1,0 +1,13 @@
+go 1.26.0
+
+use (
+	./pkg
+
+	./services/auth
+	./services/catalog
+	./services/gateway
+	./services/inventory
+	./services/notification
+	./services/order
+	./services/payment
+)

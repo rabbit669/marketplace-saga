@@ -1,0 +1,29 @@
+# Grafana data source provisioning.
+#
+# Provisioned rather than clicked: a fresh `make up` produces the same Grafana
+# every time, and the dashboards in the repository actually resolve.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Stable uid so dashboard JSON can reference the data source by name.
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      # Links a trace id in a log line straight to the Jaeger trace.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    uid: jaeger
+    url: http://jaeger:16686
+    editable: false

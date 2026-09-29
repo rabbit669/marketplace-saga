@@ -1,0 +1,133 @@
+# =============================================================================
+#  The policies that apply to every pod in the namespace.
+#
+#  Read this file first, then networkpolicy-services.yaml (who may call each
+#  service) and networkpolicy-infra.yaml (who may call each dependency).
+#
+#  The model: deny everything by default, then add back one flow at a time, each
+#  with a comment saying which flow it enables. A Kubernetes NetworkPolicy is
+#  additive and there is no "deny" rule, so the default-deny objects below are what
+#  make the later allowances meaningful — they are the whole reason a new pod in
+#  this namespace cannot reach the database until someone writes it down.
+#
+#  Enforcement caveat, stated once and true for every policy in this directory:
+#  NetworkPolicy is enforced by the CNI. kind's default CNI (kindnet) does not
+#  implement it, so on a local kind cluster these objects are stored and listed and
+#  do nothing. They are enforced on Calico, Cilium, Antrea and the managed
+#  clusters' CNIs. That is also why nothing in this stack *depends* on a policy to
+#  be correct — the safety is in the ports and the securityContexts; the policies
+#  are the second line.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  1. Deny all ingress.
+#
+#  Stops being a formality the moment a service is added: a new Deployment in this
+#  namespace accepts nothing until a policy names it, including from pods that are
+#  already allowed to talk to its neighbours.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: marketplace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# -----------------------------------------------------------------------------
+#  2. Deny all egress.
+#
+#  The half people forget. Without it, a compromised service can dial the
+#  Kubernetes API, the cloud metadata endpoint (169.254.169.254), or any other
+#  workload in the cluster — and the metadata endpoint is the one that turns a
+#  single container escape into a full account compromise.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: marketplace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# -----------------------------------------------------------------------------
+#  3. FLOW ENABLED: every pod -> DNS in kube-system.
+#
+#  This one rule is what makes the other twelve policies survivable. Every service
+#  reaches its dependencies by name (`postgres`, `kafka`, `auth:9091`), and with a
+#  default-deny egress policy that does not also allow DNS, the symptom is a
+#  connect timeout on the first dial with nothing in the application's logs to
+#  explain it: the service never gets as far as failing to connect, it fails to
+#  resolve. kube-system is selected by its own label rather than by name so that it
+#  keeps working if the cluster renames the namespace; the label is applied
+#  automatically to every namespace since 1.21.
+#
+#  Note for clusters running Cilium or another CNI with DNS-aware policy: this
+#  UDP/TCP 53 rule is still required unless the CNI is configured to allow DNS by
+#  default, and a toFQDNs policy (allowing `postgres.marketplace.svc` by name
+#  instead of by IP) would be the stricter version of this rule.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: marketplace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# -----------------------------------------------------------------------------
+#  4. FLOW ENABLED: the seven services -> Jaeger, on the OTLP ports.
+#
+#  Written now, while nothing exports spans yet, for a specific reason: the moment
+#  someone sets OTEL_ENABLED and wires the exporter, a missing egress rule looks
+#  like a broken tracer rather than a missing policy, and the day that is debugged
+#  is not the day anyone remembers that a NetworkPolicy was involved. The
+#  collector's ingress side is in networkpolicy-infra.yaml; both directions have to
+#  exist for a connection to work, which is why this is one policy object per
+#  direction rather than one per service.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-export
+  namespace: marketplace
+spec:
+  # The application pods only: component is `edge` for the gateway and `backend`
+  # for the six services, and no infrastructure pod carries either label.
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - edge
+          - backend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: jaeger
+      ports:
+        # 4317 is what OTEL_EXPORTER_OTLP_ENDPOINT names (jaeger:4317); 4318 is
+        # allowed for an exporter configured to use OTLP over HTTP instead.
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318

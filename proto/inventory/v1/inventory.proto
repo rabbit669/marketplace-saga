@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package inventory.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// InventoryService owns stock levels and the reservation lifecycle.
+//
+// The two-phase reserve/commit protocol is what makes checkout safe:
+//
+//   ReserveStock      -> stock is held, not yet sold (compensatable)
+//   CommitReservation -> stock is permanently deducted (not compensatable)
+//   ReleaseReservation-> the hold is returned to the pool (compensation)
+//
+// Everything before CommitReservation can be undone; that boundary is exactly
+// why the saga can roll back a failed payment.
+service InventoryService {
+  rpc GetStock(GetStockRequest) returns (GetStockResponse);
+  rpc SetStock(SetStockRequest) returns (SetStockResponse);
+
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+  rpc CommitReservation(CommitReservationRequest) returns (CommitReservationResponse);
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
+  rpc GetReservation(GetReservationRequest) returns (GetReservationResponse);
+}
+
+enum ReservationStatus {
+  RESERVATION_STATUS_UNSPECIFIED = 0;
+  RESERVATION_STATUS_ACTIVE = 1;    // stock held, awaiting commit or release
+  RESERVATION_STATUS_COMMITTED = 2; // stock permanently deducted (terminal)
+  RESERVATION_STATUS_RELEASED = 3;  // hold returned to the pool (terminal)
+  RESERVATION_STATUS_EXPIRED = 4;   // hold timed out and was auto-released
+}
+
+message StockItem {
+  string product_id = 1;
+  // On-hand units, including units currently held by active reservations.
+  int64 quantity = 2;
+  // Units currently held by active reservations.
+  int64 reserved = 3;
+  // quantity - reserved; never negative.
+  int64 available = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message ReservationLine {
+  string product_id = 1;
+  int64 quantity = 2;
+}
+
+message Reservation {
+  // Caller-supplied and deterministic. The order service passes its own order
+  // id, which is what makes "reserve" safe to retry: a duplicate reservation id
+  // returns the existing reservation instead of holding stock twice.
+  string reservation_id = 1;
+  string order_id = 2;
+  repeated ReservationLine lines = 3;
+  ReservationStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+message GetStockRequest {
+  repeated string product_ids = 1;
+}
+
+message GetStockResponse {
+  // Products that have never been stocked are absent rather than zero-filled;
+  // callers must treat a missing entry as "unknown", not as "zero on hand".
+  repeated StockItem items = 1;
+}
+
+message SetStockRequest {
+  string product_id = 1;
+  // Absolute target quantity, not a delta. Negative values are rejected.
+  int64 quantity = 2;
+  // Optional idempotency key for admin-driven adjustments.
+  string idempotency_key = 3;
+}
+
+message SetStockResponse {
+  StockItem item = 1;
+}
+
+message ReserveStockRequest {
+  string reservation_id = 1;
+  string order_id = 2;
+  repeated ReservationLine lines = 3;
+  // How long the hold survives before it is automatically released. Zero means
+  // the server default.
+  int64 ttl_seconds = 4;
+}
+
+message ReserveStockResponse {
+  Reservation reservation = 1;
+  // True when this call returned a pre-existing reservation rather than
+  // creating one. Surfaced so the saga can tell a retry from a first attempt.
+  bool already_existed = 2;
+}
+
+message CommitReservationRequest {
+  string reservation_id = 1;
+}
+
+message CommitReservationResponse {
+  Reservation reservation = 1;
+}
+
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+  // Free-form reason recorded for the audit trail, e.g. "payment_declined".
+  string reason = 2;
+}
+
+message ReleaseReservationResponse {
+  Reservation reservation = 1;
+  // False when the reservation was already released, so the caller can log
+  // "nothing to compensate" without treating it as an error.
+  bool released = 2;
+}
+
+message GetReservationRequest {
+  string reservation_id = 1;
+}
+
+message GetReservationResponse {
+  Reservation reservation = 1;
+}

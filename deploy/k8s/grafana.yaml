@@ -1,0 +1,272 @@
+# =============================================================================
+#  Grafana — the dashboards, provisioned from files so a fresh cluster shows the
+#  same screens with no manual clicking.
+#
+#  A StatefulSet with a PVC: Grafana keeps its users, its (hashed) credentials,
+#  its dashboard versions, its API keys and its SQLite database in
+#  /var/lib/grafana. Losing that is survivable, but it is not free — everybody
+#  loses their settings — so it is treated as state, like compose does with its
+#  named grafana-data volume.
+#
+#  Ports: 3000 (UI and /api/health).
+#
+#  Reachability: this Service is a ClusterIP and the NetworkPolicy allows the UI
+#  port from inside the cluster only. A dashboard has no business being exposed on
+#  the internet, and compose's host port 3000 is a compose-only convenience; reach
+#  it here with `kubectl -n marketplace port-forward svc/grafana 3000:3000` (see
+#  deploy/k8s/README.md).
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: marketplace
+data:
+  # Mirror of deploy/grafana/provisioning/datasources/datasources.yml, with the
+  # same service names as URLs — `prometheus:9090` and `jaeger:16686` resolve
+  # through the Services in this namespace, exactly as they do on the compose
+  # network. Duplicated rather than referenced because kustomize will not load
+  # files from outside its own directory.
+  datasources.yml: |
+    # Grafana data source provisioning.
+    #
+    # Provisioned rather than clicked: a fresh cluster produces the same Grafana
+    # every time, and the dashboards in the repository actually resolve.
+    apiVersion: 1
+
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        # Stable uid so dashboard JSON can reference the data source by name.
+        uid: prometheus
+        url: http://prometheus:9090
+        isDefault: true
+        editable: false
+        jsonData:
+          timeInterval: 15s
+          # Links a trace id in a log line straight to the Jaeger trace.
+          exemplarTraceIdDestinations:
+            - name: trace_id
+              datasourceUid: jaeger
+
+      - name: Jaeger
+        type: jaeger
+        access: proxy
+        uid: jaeger
+        url: http://jaeger:16686
+        editable: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-provider
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: marketplace
+data:
+  # Mirror of deploy/grafana/provisioning/dashboards/dashboards.yml.
+  dashboards.yml: |
+    # Grafana dashboard provisioning.
+    #
+    # Dashboards live in the repository as JSON and are loaded from disk on start,
+    # so "the dashboard broke" is a reviewable diff rather than an undocumented
+    # change someone made in the UI at 3am.
+    apiVersion: 1
+
+    providers:
+      - name: marketplace
+        orgId: 1
+        folder: Marketplace
+        folderUid: marketplace
+        type: file
+        disableDeletion: false
+        # The UI can still be used to experiment; changes are reverted on restart
+        # so that the checked-in JSON stays authoritative.
+        allowUiUpdates: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: grafana
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/part-of: marketplace
+spec:
+  serviceName: grafana
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+      app.kubernetes.io/part-of: marketplace
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grafana
+        app.kubernetes.io/component: observability
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # grafana/grafana runs as uid 472. Naming it keeps the fsGroup consistent
+        # with the SQLite database on the volume; the image's own group is 0, which
+        # would make an fsGroup-less PVC unwritable.
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          imagePullPolicy: IfNotPresent
+          env:
+            # GRAFANA_ADMIN_USER is a name, not a credential, so it lives here
+            # next to the other GF_* settings rather than in the Secret; the
+            # password does not.
+            - name: GF_SECURITY_ADMIN_USER
+              value: "admin"
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: GRAFANA_ADMIN_PASSWORD
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            # Dashboards and the Prometheus data source are provisioned from files
+            # so that a fresh cluster shows the same screens with no manual
+            # clicking.
+            - name: GF_PATHS_PROVISIONING
+              value: "/etc/grafana/provisioning"
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          # Same endpoint as the compose healthcheck. The startup budget is
+          # generous (5s x 30 = 150s) because a first start runs Grafana's own
+          # database migrations on the empty volume, and a liveness probe that
+          # fires during those would restart the process that was busy creating
+          # the database it is about to need.
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          # --------------------------------------------------------- resources
+          #
+          # How the memory figure was chosen: Grafana is a Go server with an
+          # in-memory dashboard/index cache; an idle instance with two data sources
+          # and no dashboards loaded sits well under 128Mi, and the 512Mi limit
+          # covers a large dashboard rendering with many panels. It is the smallest
+          # service in the stack and the numbers are sized accordingly rather than
+          # copied from the compose stack, which sets no limits at all.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Not read-only: Grafana writes plugin and image-renderer caches into
+            # its install directory, not only into /var/lib/grafana.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources/datasources.yml
+              subPath: datasources.yml
+              readOnly: true
+            - name: provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yml
+              subPath: dashboards.yml
+              readOnly: true
+            # The provider above reads JSON from this path. The dashboard files
+            # themselves stay in deploy/grafana/dashboards in the repository and are
+            # NOT duplicated into a ConfigMap here — duplicate a dashboard and it
+            # will drift. An emptyDir keeps the path present so a cluster without
+            # them fails a lookup instead of failing to start; to install them:
+            #
+            #   kubectl -n marketplace create configmap grafana-dashboards \
+            #     --from-file=deploy/grafana/dashboards
+            #
+            # and replace this emptyDir with that ConfigMap.
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: provisioning-datasources
+          configMap:
+            name: grafana-datasources
+        - name: provisioning-dashboards
+          configMap:
+            name: grafana-dashboards-provider
+        - name: dashboards
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: grafana
+          app.kubernetes.io/part-of: marketplace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi

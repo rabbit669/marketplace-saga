@@ -1,0 +1,406 @@
+name: marketplace
+
+# =============================================================================
+#  Local development stack.
+#
+#  Everything the platform needs, in one file: the five backing stores plus the
+#  observability stack, and the seven services built from a single Dockerfile.
+#
+#  Only the gateway and the infrastructure UIs are published on the host. The
+#  gRPC services are reachable only inside the compose network, which matches
+#  how they are deployed and prevents "it worked because I could curl it
+#  directly" from becoming an architectural habit.
+#
+#  Start with:  make up        (creates .env from .env.example on first run)
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Shared by every application container.
+x-app: &app
+  restart: unless-stopped
+  logging: *default-logging
+  env_file:
+    - ../.env
+  networks:
+    - marketplace
+
+x-build: &build
+  context: ..
+  dockerfile: deploy/docker/Dockerfile
+
+x-build-args: &build-args
+  VERSION: ${VERSION:-dev}
+  COMMIT: ${COMMIT:-none}
+  DATE: ${DATE:-unknown}
+
+# Every service reads its readiness from its own probe endpoint. The image is
+# distroless and has no shell, so the container health check is the service
+# binary itself in one-shot mode.
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 10s
+
+services:
+
+  # ------------------------------------------------------------- gateway
+  gateway:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: gateway
+    environment:
+      SERVICE_NAME: gateway
+      GATEWAY_HTTP_ADDR: ${GATEWAY_HTTP_ADDR:-:8080}
+      GATEWAY_HEALTH_ADDR: :9180
+      AUTH_GRPC_TARGET: auth:9091
+      CATALOG_GRPC_TARGET: catalog:9092
+      ORDER_GRPC_TARGET: order:9094
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set — copy .env.example to .env}
+      JWT_ISSUER: ${JWT_ISSUER:-marketplace}
+    ports:
+      - "${GATEWAY_HOST_PORT:-8080}:8080"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      auth:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- auth
+  auth:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: auth
+    environment:
+      SERVICE_NAME: auth
+      AUTH_GRPC_ADDR: :9091
+      AUTH_HEALTH_ADDR: :9191
+      AUTH_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${AUTH_DB_NAME:-auth_db}?sslmode=disable
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      JWT_ISSUER: ${JWT_ISSUER:-marketplace}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-720h}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ------------------------------------------------------------- catalog
+  catalog:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: catalog
+    environment:
+      SERVICE_NAME: catalog
+      CATALOG_GRPC_ADDR: :9092
+      CATALOG_HEALTH_ADDR: :9192
+      CATALOG_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${CATALOG_DB_NAME:-catalog_db}?sslmode=disable
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ----------------------------------------------------------- inventory
+  inventory:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: inventory
+    environment:
+      SERVICE_NAME: inventory
+      INVENTORY_GRPC_ADDR: :9093
+      INVENTORY_HEALTH_ADDR: :9193
+      INVENTORY_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${INVENTORY_DB_NAME:-inventory_db}?sslmode=disable
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      INVENTORY_RESERVATION_TTL: ${INVENTORY_RESERVATION_TTL:-15m}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # --------------------------------------------------------------- order
+  order:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: order
+    environment:
+      SERVICE_NAME: order
+      ORDER_GRPC_ADDR: :9094
+      ORDER_HEALTH_ADDR: :9194
+      ORDER_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${ORDER_DB_NAME:-order_db}?sslmode=disable
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      CATALOG_GRPC_TARGET: catalog:9092
+      INVENTORY_GRPC_TARGET: inventory:9093
+      PAYMENT_GRPC_TARGET: payment:9095
+      SAGA_MAX_ATTEMPTS: ${SAGA_MAX_ATTEMPTS:-5}
+      SAGA_STEP_TIMEOUT: ${SAGA_STEP_TIMEOUT:-3s}
+      SAGA_RECOVERY_INTERVAL: ${SAGA_RECOVERY_INTERVAL:-30s}
+      SAGA_STUCK_AFTER: ${SAGA_STUCK_AFTER:-2m}
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-1s}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+
+  # ------------------------------------------------------------- payment
+  payment:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: payment
+    environment:
+      SERVICE_NAME: payment
+      PAYMENT_GRPC_ADDR: :9095
+      PAYMENT_HEALTH_ADDR: :9195
+      PAYMENT_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${PAYMENT_DB_NAME:-payment_db}?sslmode=disable
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      # Deliberately non-zero in development so the saga's compensation path
+      # runs on ordinary traffic instead of only in tests.
+      PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0.15}
+      PAYMENT_LATENCY_MS: ${PAYMENT_LATENCY_MS:-50}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # -------------------------------------------------------- notification
+  notification:
+    <<: *app
+    build:
+      <<: *build
+      args:
+        <<: *build-args
+        SERVICE: notification
+    environment:
+      SERVICE_NAME: notification
+      NOTIFICATION_HEALTH_ADDR: :9196
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      NOTIFICATION_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${NOTIFICATION_DB_NAME:-notification_db}?sslmode=disable
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/service", "-health-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ========================================================== infrastructure
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-marketplace}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketplace}
+      POSTGRES_DB: postgres
+      # Faster and quieter than the default for a development database, and it
+      # makes test runs reproducible without waiting on the WAL flusher.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketplace} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - marketplace
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    # Cache and rate-limit state only: losing it is survivable, so persistence
+    # is switched off and memory is bounded with an eviction policy.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - marketplace
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # Single-node KRaft: no ZooKeeper, the broker is its own controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Single node means every replication factor must be 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - marketplace
+
+  # ========================================================= observability
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Development retention: keep traces in memory, no storage backend.
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: 10000
+    ports:
+      - "${JAEGER_UI_HOST_PORT:-16686}:16686"   # UI
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - marketplace
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - marketplace
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # Dashboards and the Prometheus data source are provisioned from files so
+      # that a fresh clone shows the same screens with no manual clicking.
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - marketplace
+
+networks:
+  marketplace:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:

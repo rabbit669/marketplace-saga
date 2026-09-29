@@ -1,0 +1,159 @@
+# =============================================================================
+#  Jaeger — all-in-one collector, query and UI, for tracing.
+#
+#  No PersistentVolumeClaim, and that is a deliberate choice rather than an
+#  oversight: compose runs Jaeger with SPAN_STORAGE_TYPE=memory and no volume, so
+#  traces are a development debugging aid that starts empty and is dropped on
+#  restart. Giving it a PVC would imply a retention guarantee this deployment does
+#  not make; a real one replaces the storage type with a backend (Cassandra,
+#  Elasticsearch, or OTLP export) and becomes a StatefulSet.
+#
+#  Ports, from deploy/docker-compose.yml and the Jaeger all-in-one image:
+#    16686  UI + query API      (published on the host by compose)
+#    4317   OTLP over gRPC      (OTEL_EXPORTER_OTLP_ENDPOINT=jaeger:4317)
+#    4318   OTLP over HTTP
+#    14269  admin: /health, /metrics (what the compose healthcheck probes)
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: ui
+      protocol: TCP
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+    - name: admin
+      port: 14269
+      targetPort: admin
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/part-of: marketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jaeger
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jaeger
+        app.kubernetes.io/component: observability
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # The jaegertracing images run as their own non-root uid. It is named here
+        # rather than in the container so that the fsGroup would follow it if this
+        # ever gains a volume; verify the uid with `docker inspect` if the tag is
+        # bumped.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.62.0
+          imagePullPolicy: IfNotPresent
+          env:
+            # Same three settings as compose: OTLP ingest enabled, spans in
+            # memory, 10k traces retained.
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+            - name: SPAN_STORAGE_TYPE
+              value: "memory"
+            - name: MEMORY_MAX_TRACES
+              value: "10000"
+          ports:
+            - name: ui
+              containerPort: 16686
+              protocol: TCP
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: admin
+              containerPort: 14269
+              protocol: TCP
+          # Same endpoint as the compose healthcheck (wget --spider on the admin
+          # port). Liveness is lenient: losing the collector loses traces, which is
+          # an observability problem, not an outage — restarting it in a loop while
+          # it is merely busy would make both worse.
+          startupProbe:
+            httpGet:
+              path: /
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: admin
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          # --------------------------------------------------------- resources
+          #
+          # How the memory figure was chosen: MEMORY_MAX_TRACES=10000 is the real
+          # ceiling. A few hundred bytes per span puts the retained traces in the
+          # low double-digit MiB; the rest of the 512Mi limit is the collector's
+          # batching and export queues. Raising MEMORY_MAX_TRACES without raising
+          # this limit would turn a retention setting into an OOM kill.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Not read-only: the image writes its UI assets' cache and the admin
+            # endpoint's runtime files, and unlike the application images this one
+            # is not ours. See the note in deploy/k8s/README.md about which
+            # hardening steps are still open for third-party images.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL

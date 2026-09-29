@@ -1,0 +1,62 @@
+# =============================================================================
+#  PodDisruptionBudgets — for the gateway and the order service, and for nothing
+#  else.
+#
+#  A PDB constrains *voluntary* disruption: node drains, cluster upgrades, the
+#  eviction API. It does nothing about a crash, a bad deploy or an OOM kill, which
+#  is why it is paired here with more than one replica and with `maxUnavailable: 0`
+#  rolling updates in the Deployments.
+#
+#  Why these two and not all seven:
+#    * gateway — the only entry point. If both edge replicas are evicted at once,
+#      every customer request fails for as long as the drain takes, and there is no
+#      other path into the system;
+#    * order — the saga orchestrator. Evicting every replica at once does not just
+#      fail requests, it pauses the recovery worker that resumes stuck sagas, so a
+#      checkout that was mid-compensation stays mid-compensation until a replica
+#      comes back. The other five services are either stateless and cheap to
+#      restart (auth, catalog, inventory, payment) or have no inbound traffic at
+#      all (notification), and with one replica each a budget of minAvailable 1
+#      would simply block every drain in the cluster rather than protect anything.
+#
+#  Why minAvailable: 1 rather than maxUnavailable: 0: with two replicas,
+#  maxUnavailable 0 means "never evict anything", which makes an ordinary node
+#  drain hang forever. Allowing exactly one replica to be down at a time keeps the
+#  service answering while an upgrade proceeds.
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # One of the two edge replicas may be evicted at a time; the other keeps serving.
+  # Paired with the HPA's minReplicas: 2, so the floor cannot drift below the
+  # budget's assumption.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+      app.kubernetes.io/part-of: marketplace
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: order
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # One replica must stay up: the saga recovery worker lives in this process, and
+  # with every replica gone, sagas that were left mid-flight are not resumed until
+  # one returns. The store's optimistic concurrency makes two workers safe, so
+  # exactly one is enough to keep recovery moving.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order
+      app.kubernetes.io/part-of: marketplace

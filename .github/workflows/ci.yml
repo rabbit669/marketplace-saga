@@ -1,0 +1,289 @@
+# =============================================================================
+#  CI: lint, test, build every image, validate the Kubernetes manifests.
+#
+#  The one thing to know before editing this file:
+#
+#    THE REPOSITORY ROOT IS NOT A GO MODULE. It is a go.work file spanning eight
+#    modules (pkg plus the seven services), so `go test ./...` from the root fails
+#    with "directory prefix . does not contain modules listed in go.work". The
+#    Makefile solves this with its `for-each-module` target, and so does this
+#    workflow: every Go command runs *inside* a module directory. The test job uses
+#    a matrix for that rather than a shell loop, so a failure is attributed to a
+#    module instead of to "the tests job".
+#
+#  Locally the same checks are `gofmt -s -l .`, `make vet`, `cd proto && buf lint`,
+#  `make test-race`, `make build`, and `kubectl kustomize deploy/k8s`.
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per ref. A push that supersedes an in-flight run cancels it: a queued
+# image build for a commit nobody will merge is the most expensive kind of waste.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository or calls the API, so the token gets no
+# permissions at all rather than the default read/write set.
+permissions:
+  contents: read
+
+env:
+  # Tracks the `go` directive in go.work (go 1.26.0), which the eight modules agree
+  # with. The patch release is deliberately not pinned: a patch version is a
+  # security boundary, and there is no toolchain file for it to disagree with.
+  #
+  # Note that the Dockerfile's build stage uses a newer toolchain
+  # (golang:1.27-alpine). That is fine and intentional: a newer Go builds a module
+  # that requires 1.26, and CI is the place where the *declared* version is the one
+  # that has to work.
+  GO_VERSION: "1.26.x"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  #  lint — formatting, vet, and the proto contracts.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Caches the module cache and the build cache, keyed on the go.sum files.
+          # There are eight of them (one per module) and they live at different
+          # depths, hence the glob.
+          cache: true
+          cache-dependency-path: "**/go.sum"
+
+      # A file walk, not a module command, so the workspace root is fine here.
+      # `-l` lists instead of rewriting: CI must never modify the checkout, and a
+      # diff of what gofmt wanted is more useful in the log than a silent fix.
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -s -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -s would rewrite these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # `make vet` is the for-each-module target with GOAL="go vet ./...".
+      # Calling the Makefile rather than repeating the module list here means the
+      # list exists in exactly one place.
+      - name: go vet (every module)
+        run: make vet
+
+      # buf lint is a review aid, not a gate: it is installed at lint time, and if
+      # that install fails the step warns instead of failing the build. proto/ is
+      # the source of truth for every API in this repository, so a lint regression
+      # there is worth catching — but not worth blocking a security patch on.
+      - name: buf lint
+        run: |
+          set -euo pipefail
+          BUF="$(go env GOPATH)/bin/buf"
+          if go install github.com/bufbuild/buf/cmd/buf@latest; then
+            cd proto && "$BUF" lint
+          else
+            echo "::warning::buf could not be installed; skipping proto lint"
+          fi
+
+  # ---------------------------------------------------------------------------
+  #  test — the unit suite with the race detector, one matrix leg per module.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      # One broken module should not hide the state of the other seven.
+      fail-fast: false
+      matrix:
+        module:
+          - pkg
+          - services/auth
+          - services/catalog
+          - services/gateway
+          - services/inventory
+          - services/notification
+          - services/order
+          - services/payment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: "**/go.sum"
+
+      # `-race` on every module, not only on the concurrency-heavy ones: the race
+      # detector is the reason the saga engine's compensation path can be trusted,
+      # and it costs a few seconds per module on this suite.
+      #
+      # `-count=1` disables the test cache, because a cached pass is not a test run.
+      #
+      # The eight matrix legs are the CI form of the Makefile's for-each-module
+      # target; `make test-race` does the same thing locally, sequentially.
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        run: go test ./... -count=1 -race
+
+  # ---------------------------------------------------------------------------
+  #  build — all seven images, from the one Dockerfile, on BuildKit.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build images
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # BuildKit. The Dockerfile's first line is `# syntax=docker/dockerfile:1.7`
+      # and it uses cache mounts, which the legacy builder does not support, so
+      # buildx is required rather than convenient.
+      - uses: docker/setup-buildx-action@v3
+
+      # One job with a loop, not a seven-way matrix. The Dockerfile is built so
+      # that all seven services share the dependency layer (every module resolves
+      # `github.com/marketplace/pkg` by relative path, so the COPY go.work/go.mod
+      # layer is identical for all of them); a matrix would throw that sharing away
+      # and build the same dependency layer seven times in parallel.
+      #
+      # The build context is the repository ROOT, and it has to be: the Dockerfile
+      # copies go.work, pkg/ and services/ and needs all eight modules present for
+      # `go work sync` and for the relative module replacements to resolve.
+      #
+      # `--load` is deliberately absent: nothing consumes these images in CI, and
+      # the build completing is the assertion. (The Dockerfile also has a `test`
+      # stage for running the suite inside the build toolchain:
+      # `docker build --target test`.)
+      - name: docker buildx build (7 services)
+        env:
+          SERVICES: auth catalog gateway inventory notification order payment
+        run: |
+          set -euo pipefail
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for service in $SERVICES; do
+            echo "::group::building $service"
+            docker buildx build \
+              --file deploy/docker/Dockerfile \
+              --build-arg SERVICE="$service" \
+              --build-arg VERSION="$VERSION" \
+              --build-arg COMMIT="$COMMIT" \
+              --build-arg DATE="$DATE" \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --tag "marketplace/$service:$COMMIT" \
+              .
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  #  manifests — render and validate deploy/k8s the way `make k8s-apply` will.
+  # ---------------------------------------------------------------------------
+  manifests:
+    name: validate manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # `kubectl kustomize` is the kustomize build that ships inside kubectl, so no
+      # extra tool is installed and CI renders with the same implementation a
+      # cluster's `kubectl apply -k` uses. This is what catches a resource listed
+      # in kustomization.yaml that does not exist, a broken transformer, or a
+      # duplicate resource id.
+      - name: kustomize build
+        run: kubectl kustomize deploy/k8s > /tmp/rendered.yaml
+
+      # Client-side dry run: no cluster, no credentials, no side effects. It
+      # validates the API version, kind and field names of every object against
+      # kubectl's own schema.
+      - name: kubectl apply --dry-run=client
+        run: kubectl apply --dry-run=client -f /tmp/rendered.yaml
+
+      # Assertions on the rendered output, for the mistakes that render cleanly and
+      # are still wrong: a workload with no probes, an image tag CI never builds, a
+      # node port that kind-up.sh does not agree with.
+      #
+      # These are deliberately grep-based rather than schema-based. The schemas are
+      # already covered by the two steps above; what is left is the set of
+      # invariants that only this repository knows about. (kubeconform or kube-score
+      # would be the fuller version of the schema half.)
+      #
+      # All the counts below were checked against the real output of
+      # `kustomize build deploy/k8s`, and they are counts of *fields*, so they do not
+      # depend on how kustomize chooses to indent or order anything.
+      - name: asserted sanity checks
+        run: |
+          set -euo pipefail
+          rendered=/tmp/rendered.yaml
+
+          # 13 workloads: 7 Deployments for the services, plus 6 for the
+          # dependencies — postgres, kafka, prometheus and grafana are StatefulSets
+          # (they have PVCs), redis and jaeger are Deployments (emptyDir and memory
+          # storage respectively).
+          # `|| true` on every count: `grep -c` exits non-zero when the count is
+          # zero, and under `set -e` that would abort the step inside the command
+          # substitution, before the message below could say what was wrong.
+          workloads="$(grep -cE '^kind: (Deployment|StatefulSet)$' "$rendered" || true)"
+          if [ "$workloads" -ne 13 ]; then
+            echo "::error::expected 13 workloads in deploy/k8s, found $workloads"
+            exit 1
+          fi
+
+          # Every container must carry all three probes, and there are exactly 13
+          # containers (one per workload). Equal counts on all three means no
+          # container was left with only some of them, which is the shape this
+          # mistake actually takes: someone adds a sidecar and gives it a readiness
+          # probe only.
+          ready="$(grep -c 'readinessProbe:' "$rendered" || true)"
+          live="$(grep -c 'livenessProbe:' "$rendered" || true)"
+          start="$(grep -c 'startupProbe:' "$rendered" || true)"
+          if [ "$ready" -ne 13 ] || [ "$live" -ne 13 ] || [ "$start" -ne 13 ]; then
+            echo "::error::probes are not on all 13 containers (readiness=$ready liveness=$live startup=$start)"
+            exit 1
+          fi
+
+          # Seven application images, all built by deploy/docker/Dockerfile: one per
+          # service, so this catches a service that was dropped from the
+          # kustomization or lost its container.
+          images="$(grep -c 'image: marketplace/' "$rendered" || true)"
+          if [ "$images" -ne 7 ]; then
+            echo "::error::expected 7 marketplace images, found $images"
+            exit 1
+          fi
+
+          # `latest` resolves to imagePullPolicy: Always, which cannot work for an
+          # image that only exists in the local registry a kind cluster was given.
+          if grep -q ':latest' "$rendered"; then
+            echo "::error::an image uses the :latest tag"
+            exit 1
+          fi
+
+          # scripts/kind-up.sh maps the host's port 8080 onto this node port. If the
+          # two ever disagree, `make up` works and kind-up.sh silently serves
+          # nothing on localhost:8080.
+          if ! grep -q 'nodePort: 30080' "$rendered"; then
+            echo "::error::the gateway NodePort is not 30080; scripts/kind-up.sh maps host 8080 onto it"
+            exit 1
+          fi
+
+      # The scripts name the same namespace and resources as the manifests, so a
+      # syntax error in them is a failed cluster bring-up ten minutes into a
+      # developer's afternoon.
+      - name: shell syntax check
+        run: bash -n scripts/kind-up.sh scripts/kind-down.sh

@@ -1,0 +1,145 @@
+# =============================================================================
+#  catalog — products and prices; the source of the checkout price snapshot.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9092   grpc    called by the gateway and by order   CATALOG_GRPC_ADDR
+#    9192   health  /healthz /readyz /version /metrics   CATALOG_HEALTH_ADDR
+#
+#  Two callers, which is the reason its NetworkPolicy has two ingress rules: the
+#  gateway serves product browsing, and order snapshots prices as the first step
+#  of the checkout saga. Missing the second rule is the classic "works in the
+#  browser, times out in checkout" bug.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: catalog
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # single replica: start the new pod before stopping the old one
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: catalog
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: catalog
+          image: marketplace/catalog:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9092
+              protocol: TCP
+            - name: health
+              containerPort: 9192
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "catalog"
+            - name: CATALOG_GRPC_ADDR
+              value: ":9092"
+            - name: CATALOG_HEALTH_ADDR
+              value: ":9192"
+            - name: REDIS_ADDR
+              value: "redis:6379"
+            - name: CATALOG_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: CATALOG_DB_DSN
+          # 60s of startup budget: this service is the one that seeds demo
+          # products on a fresh database in the dev environment, and that seed
+          # happens before the readiness checks settle.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: grpc
+      port: 9092
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 9192
+      targetPort: health
+      protocol: TCP

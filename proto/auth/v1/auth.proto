@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package auth.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// AuthService owns identities, credentials and token issuance.
+//
+// It is the only service that ever sees a password. The API gateway calls
+// ValidateToken on every inbound request and never touches the user database.
+service AuthService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // ValidateToken is the hot path: called by the gateway on every request.
+  // Implementations are expected to verify the JWT signature locally and only
+  // fall back to a database lookup when the token is not self-sufficient
+  // (for example after a revocation).
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_CUSTOMER = 1;
+  ROLE_ADMIN = 2;
+}
+
+message User {
+  string id = 1;
+  string email = 2;
+  string full_name = 3;
+  repeated Role roles = 4;
+  bool email_verified = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+  string full_name = 3;
+}
+
+message RegisterResponse {
+  User user = 1;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+  // Optional client hint recorded for auditing, e.g. "web", "ios".
+  string client = 3;
+}
+
+message LoginResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+  // Access token lifetime in seconds.
+  int64 expires_in = 3;
+  User user = 4;
+}
+
+message RefreshRequest {
+  string refresh_token = 1;
+}
+
+message RefreshResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 expires_in = 3;
+}
+
+message LogoutRequest {
+  // Revokes every refresh token issued to the caller's session family.
+  string refresh_token = 1;
+}
+
+message LogoutResponse {}
+
+message ValidateTokenRequest {
+  string access_token = 1;
+}
+
+message ValidateTokenResponse {
+  bool valid = 1;
+  string user_id = 2;
+  string email = 3;
+  repeated Role roles = 4;
+  // Populated when valid is false, e.g. "expired", "malformed", "revoked".
+  string reason = 5;
+}
+
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}

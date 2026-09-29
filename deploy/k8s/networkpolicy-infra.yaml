@@ -1,0 +1,337 @@
+# =============================================================================
+#  One policy per dependency: who is allowed to reach PostgreSQL, Redis, Kafka,
+#  Jaeger, Prometheus and Grafana, and what each of them may reach in turn.
+#
+#  This is the half of the policy model that is usually missing. The service
+#  policies above constrain what a service may *call*; these constrain what may
+#  call a dependency, which is what stops a compromised catalog pod from opening a
+#  psql session against order_db, or a random workload from walking the Kafka log.
+#
+#  The "anyone -> health/metrics port" convention is explained at the top of
+#  networkpolicy-services.yaml and is not repeated in full here. For the
+#  observability UIs (Jaeger 16686, Prometheus 9090, Grafana 3000) the same 0.0.0.0/0
+#  form appears, and it is worth being precise about what it means: a source of
+#  0.0.0.0/0 can only reach an address it can already route to, and these are
+#  ClusterIPs — there is no NodePort or Ingress in front of them, so the practical
+#  effect is "a pod in the cluster, or a port-forward through the API server". The
+#  one rule in the whole directory that admits genuinely external traffic is
+#  gateway:8080.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  PostgreSQL — reachable from the six services that own a database, and from
+#  nothing else. Note what is absent: the gateway has no database. It is the edge,
+#  and it holds no state.
+#
+#  There is no egress rule. The default-deny-egress policy therefore leaves this
+#  pod with no outbound traffic at all, which is correct for a database server: it
+#  dials nothing, not even DNS.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    # FLOW ENABLED: auth, catalog, inventory, order, payment and notification ->
+    # postgres:5432. One rule with six selectors rather than six rules: they grant
+    # the same permission on the same port, and the database cannot tell which
+    # service is connecting anyway — that is what the separate databases and their
+    # credentials are for. (Splitting this further would mean per-service database
+    # users, which is the next step up in isolation and not something this stack has
+    # implemented.)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: auth
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inventory
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# -----------------------------------------------------------------------------
+#  Redis — a cache for exactly two services. It is deliberately not reachable from
+#  order or payment: a service that can reach a cache it does not use is a service
+#  whose future bug will be written into shared state.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    # FLOW ENABLED: auth and catalog -> redis:6379.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: auth
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# -----------------------------------------------------------------------------
+#  Kafka — producers and the consumer, plus the broker itself.
+#
+#  This is the one policy with rules in both directions for the *same* pod, and the
+#  reason is KRaft: the quorum voter address is `1@kafka:9093`, a hostname that
+#  resolves through the Service back to this broker, so the broker has to be allowed
+#  to reach itself. It also needs DNS for that same reason — a self-connection that
+#  starts with a name lookup fails without it, and the resulting error ("unable to
+#  connect to node 1") reads like a cluster problem rather than a policy one.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: catalog, inventory, order, payment and notification ->
+    # kafka:9092. The client listener. auth and the gateway are absent on purpose:
+    # auth publishes nothing and the edge consumes nothing, so neither has any
+    # business holding a broker connection.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inventory
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification
+      ports:
+        - protocol: TCP
+          port: 9092
+    # FLOW ENABLED: kafka -> kafka, on both listeners. The self-reference above:
+    # inter-broker traffic on 9092 and the controller quorum on 9093. With one node
+    # this looks redundant, and it is not — the broker really does dial itself, and
+    # removing the rule would leave a broker that starts, logs a quorum error, and
+    # never becomes ready. It is also correct as written for a three-broker cluster,
+    # where the same rule permits the replication traffic.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+  egress:
+    # FLOW ENABLED: kafka -> kafka:9092, kafka:9093. The egress half of the rule
+    # above: a connection needs permission in both directions, and the KRaft voter
+    # address is a hostname, which is why allow-dns in networkpolicy-baseline.yaml
+    # matters here as much as it does for the services.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+---
+# -----------------------------------------------------------------------------
+#  Jaeger — span ingest from the seven services, trace queries from Grafana, and
+#  the UI.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jaeger
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jaeger
+  # Ingress only: Jaeger is configured with in-memory storage
+  # (SPAN_STORAGE_TYPE=memory), so it exports nothing and stores nothing off-box
+  # and has no egress rule of its own — the default-deny-egress policy leaves it
+  # with the DNS allowance every pod gets and nothing else. A deployment that
+  # switched to a storage backend, or that re-exported over OTLP, would need that
+  # flow written down here; the failure mode if it were forgotten is silent (the
+  # collector drops batches and logs a timeout).
+  policyTypes:
+    - Ingress
+  ingress:
+    # FLOW ENABLED: the seven services -> jaeger:4317/4318 (OTLP ingest). The
+    # matching egress rule is allow-otel-export in networkpolicy-baseline.yaml.
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - edge
+                  - backend
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    # FLOW ENABLED: Grafana -> jaeger:16686. The Jaeger *data source* is not a
+    # browser link: Grafana's server calls the query API itself when a dashboard
+    # panel asks for traces, so this is a real pod-to-pod flow and not a UI
+    # convenience.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+      ports:
+        - protocol: TCP
+          port: 16686
+    # FLOW ENABLED: the query UI by port-forward, and the kubelet's probes on the
+    # admin port (14269 is where /health lives — the compose healthcheck probes
+    # exactly that port with wget).
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 16686
+        - protocol: TCP
+          port: 14269
+---
+# -----------------------------------------------------------------------------
+#  Prometheus — the one component that legitimately talks to everything, and only
+#  on the metrics ports.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: Grafana -> prometheus:9090, and the kubelet's probes, and
+    # sqlite-free `kubectl port-forward` access for a human with a query. The
+    # Service is a ClusterIP; nothing publishes 9090 outside the cluster.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # FLOW ENABLED: prometheus -> every pod in this namespace on a health/metrics
+    # port. This is the scrape path, and it is the reason each service's Service
+    # publishes its health port: the scrape config names `auth:9191`,
+    # `catalog:9192`, and so on — the same strings as
+    # deploy/prometheus/prometheus.yml, because the Services are named after the
+    # compose services.
+    #
+    # The self-scrape (`localhost:9090` in the config) needs no rule: loopback
+    # traffic inside a pod does not cross the CNI's enforcement point.
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9180   # gateway
+        - protocol: TCP
+          port: 9191   # auth
+        - protocol: TCP
+          port: 9192   # catalog
+        - protocol: TCP
+          port: 9193   # inventory
+        - protocol: TCP
+          port: 9194   # order
+        - protocol: TCP
+          port: 9195   # payment
+        - protocol: TCP
+          port: 9196   # notification
+---
+# -----------------------------------------------------------------------------
+#  Grafana — the UI, and its two data sources.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  namespace: marketplace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # FLOW ENABLED: the UI on 3000, for the kubelet's readiness probe and for a
+    # developer reaching it through `kubectl -n marketplace port-forward
+    # svc/grafana 3000:3000`. It is a ClusterIP: there is no external path to it,
+    # and there should not be — a dashboard has no authentication story worth
+    # relying on for a public address.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    # FLOW ENABLED: grafana -> prometheus:9090 (the default data source, queried
+    # server-side by the Grafana process, not by the browser).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+    # FLOW ENABLED: grafana -> jaeger:16686 (the second data source, and the target
+    # of the exemplar links on the Prometheus datasource in grafana.yaml).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: jaeger
+      ports:
+        - protocol: TCP
+          port: 16686

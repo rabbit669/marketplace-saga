@@ -1,0 +1,100 @@
+# =============================================================================
+#  Non-secret configuration, exactly the shared half of .env.example.
+#
+#  Why a shared ConfigMap and not `env_file: ../.env` (what compose does):
+#  in compose every application container receives the entire .env, so the
+#  gateway is configured by variables that describe the order service. Here the
+#  shared surface lives in one object and each service's own settings (its listen
+#  address, its DSN, its knobs) live next to the container that reads them, so
+#  changing the payment simulation cannot reconfigure the gateway by accident.
+#
+#  Every value below is copied from .env.example; the value in the comment is the
+#  line it came from, so a reviewer can diff the two files by eye.
+#
+#  Deliberately NOT here, and why:
+#    * JWT_SECRET, POSTGRES_PASSWORD, the *_DB_DSN values -> secret.yaml.
+#    * <SERVICE>_GRPC_ADDR / <SERVICE>_HEALTH_ADDR / GATEWAY_HTTP_ADDR ->
+#      the owning service's Deployment, so a listen address cannot be changed
+#      from another service's file. (compose sets them in each service block too.)
+#    * POSTGRES_HOST / POSTGRES_PORT / <SERVICE>_DB_NAME -> the DSNs in
+#      marketplace-secrets are complete values, so repeating the host here would
+#      create a second place that can disagree with them. POSTGRES_USER,
+#      POSTGRES_PASSWORD and POSTGRES_DB are settings of the database container
+#      itself and live in postgres.yaml, which is where compose sets them.
+#    * RATE_LIMIT_RPS / RATE_LIMIT_BURST -> gateway.yaml, under their bare names.
+#      They are read unprefixed because they describe the edge as a whole rather
+#      than one service's copy of it, which is also how .env.example and compose
+#      spell them.
+#    * PROMETHEUS_ADDR -> nothing to configure: every service serves /metrics on
+#      its health port, which is exactly what deploy/prometheus/prometheus.yml
+#      scrapes (and what this cluster's prometheus ConfigMap scrapes too).
+#    * *_HOST_PORT / GATEWAY_HOST_PORT / GRAFANA_ADMIN_* -> compose publishes
+#      host ports; Kubernetes has nodePorts and Ingress instead, and the Grafana
+#      admin credentials are secrets.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: marketplace-config
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/part-of: marketplace
+data:
+  # .env.example: runtime
+  APP_ENV: "dev"                    # dev | staging | prod
+  LOG_LEVEL: "info"                 # debug | info | warn | error
+  LOG_FORMAT: "json"                # json (prod) | text (local)
+
+  # .env.example: redis, kafka
+  # Both are hostnames that resolve through the Services in this namespace, so
+  # the same strings work in compose and here — which is the point of naming the
+  # Kubernetes Services after the compose services.
+  REDIS_ADDR: "redis:6379"
+  KAFKA_BROKERS: "kafka:9092"       # in-network listener; 29092 is a compose host port
+  KAFKA_TOPIC_PREFIX: "marketplace"
+  # .env.example spells this KAFKA_CONSUMER_GROUP_SUFFIX; the consumer composes
+  # "<prefix>.<service>.v1" from it, which is also its default when unset.
+  KAFKA_CONSUMER_GROUP_SUFFIX: "v1"
+
+  # .env.example: gRPC client targets
+  # Consumers are the gateway (auth, order, and a catalog target it is configured
+  # with) and the order service (catalog, inventory, payment).
+  AUTH_GRPC_TARGET: "auth:9091"
+  CATALOG_GRPC_TARGET: "catalog:9092"
+  INVENTORY_GRPC_TARGET: "inventory:9093"
+  ORDER_GRPC_TARGET: "order:9094"
+  PAYMENT_GRPC_TARGET: "payment:9095"
+
+  # .env.example: tokens (the signing secret is in secret.yaml)
+  # Gateway and auth read these unprefixed on purpose: one signs, the other
+  # verifies, and a prefix mismatch would let them disagree about the issuer.
+  JWT_ISSUER: "marketplace"
+  JWT_ACCESS_TTL: "15m"
+  JWT_REFRESH_TTL: "720h"
+
+  # .env.example: saga
+  SAGA_MAX_ATTEMPTS: "5"
+  SAGA_STEP_TIMEOUT: "3s"
+  SAGA_RECOVERY_INTERVAL: "30s"     # how often the recovery worker polls for stuck sagas
+  SAGA_STUCK_AFTER: "2m"            # a saga older than this is considered stuck
+
+  # .env.example: resilience
+  RESILIENCE_RETRY_MAX_ATTEMPTS: "4"
+  RESILIENCE_RETRY_BASE_DELAY: "50ms"
+  RESILIENCE_RETRY_MAX_DELAY: "2s"
+  RESILIENCE_CIRCUIT_BREAKER_THRESHOLD: "5"
+  RESILIENCE_CIRCUIT_BREAKER_TIMEOUT: "30s"
+
+  # .env.example: outbox
+  OUTBOX_POLL_INTERVAL: "1s"
+  OUTBOX_BATCH_SIZE: "100"
+  OUTBOX_MAX_ATTEMPTS: "10"
+
+  # .env.example: observability
+  # jaeger:4317 is the OTLP gRPC ingest port of the in-cluster Jaeger Service;
+  # the NetworkPolicy in networkpolicy-baseline.yaml already permits this flow so
+  # that turning tracing on is a configuration change, not a policy change.
+  OTEL_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+  OTEL_TRACES_SAMPLER_RATIO: "1.0"
+  OTEL_METRICS_ENABLED: "true"

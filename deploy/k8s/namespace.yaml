@@ -1,0 +1,30 @@
+# =============================================================================
+#  The namespace everything in deploy/k8s lands in.
+#
+#  One namespace, not one per service. The services are deliberately chatty with
+#  each other over gRPC and Kafka, and splitting them into namespaces would buy
+#  almost nothing except a longer NetworkPolicy (every rule would need a
+#  namespaceSelector) and DNS names that no longer match the compose network
+#  (`auth:9091` works in both, which is why the *_GRPC_TARGET values are the
+#  same string in .env.example and here).
+#
+#  Pod Security Admission is set to baseline, not restricted:
+#    * the seven application pods are written to the restricted profile (nonroot
+#      uid 65532, read-only root filesystem, all capabilities dropped, seccomp
+#      RuntimeDefault) and pass it;
+#    * the third-party infrastructure images (PostgreSQL, Redis, Kafka, Jaeger,
+#      Prometheus, Grafana) are pinned by tag but not audited here, and their
+#      entrypoints legitimately need more (postgres and redis start as root and
+#      drop to their own user with gosu, which needs SETUID/SETGID/CHOWN).
+#  Flip `enforce` to restricted once the infrastructure images have been checked
+#  against it — the `warn` label below already reports which ones would fail.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marketplace
+  labels:
+    app.kubernetes.io/part-of: marketplace
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

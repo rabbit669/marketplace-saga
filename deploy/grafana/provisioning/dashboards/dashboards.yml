@@ -1,0 +1,22 @@
+# Grafana dashboard provisioning.
+#
+# Dashboards live in the repository as JSON and are loaded from disk on start,
+# so "the dashboard broke" is a reviewable diff rather than an undocumented
+# change someone made in the UI at 3am.
+
+apiVersion: 1
+
+providers:
+  - name: marketplace
+    orgId: 1
+    folder: Marketplace
+    folderUid: marketplace
+    type: file
+    disableDeletion: false
+    # The UI can still be used to experiment; changes are reverted on restart
+    # so that the checked-in JSON stays authoritative.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

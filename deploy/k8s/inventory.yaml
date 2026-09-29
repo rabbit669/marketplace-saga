@@ -1,0 +1,152 @@
+# =============================================================================
+#  inventory — stock levels and the two-phase reservation lifecycle.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9093   grpc    called by order, and only by order   INVENTORY_GRPC_ADDR
+#    9193   health  /healthz /readyz /version /metrics   INVENTORY_HEALTH_ADDR
+#
+#  Nothing outside the saga calls this service: reservations are a consequence of
+#  a checkout, never a user action, so its NetworkPolicy allows the order service
+#  and nothing else. The expiry worker that releases timed-out reservations runs
+#  inside the same process, which is why it needs PostgreSQL and not much else.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: inventory
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inventory
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inventory
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: inventory
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: inventory
+          image: marketplace/inventory:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9093
+              protocol: TCP
+            - name: health
+              containerPort: 9193
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "inventory"
+            - name: INVENTORY_GRPC_ADDR
+              value: ":9093"
+            - name: INVENTORY_HEALTH_ADDR
+              value: ":9193"
+            # .env.example: how long a reservation may be held before the expiry
+            # worker releases it. It must stay comfortably above the saga's own
+            # step budget (SAGA_STEP_TIMEOUT x SAGA_MAX_ATTEMPTS) or stock would
+            # be released underneath a retry that is still running.
+            - name: INVENTORY_RESERVATION_TTL
+              value: "15m"
+            - name: INVENTORY_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: INVENTORY_DB_DSN
+          # A reservation is a small transaction over a small table; 60s of
+          # startup budget is about a cold node and a first database connection,
+          # not about long-running work.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              # Slightly above the other backends: the expiry worker holds the
+              # reservation set for a TTL window in memory while it sweeps, so the
+              # steady state is a little larger.
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: inventory
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: inventory
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: grpc
+      port: 9093
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 9193
+      targetPort: health
+      protocol: TCP

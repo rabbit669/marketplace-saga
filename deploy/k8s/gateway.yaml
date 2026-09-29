@@ -1,0 +1,253 @@
+# =============================================================================
+#  gateway — the public REST edge, and the only service reachable from outside
+#  the cluster.
+#
+#  Ports, mirrored from deploy/docker-compose.yml, .env.example and
+#  deploy/prometheus/prometheus.yml:
+#
+#    8080   http    the public REST API                 GATEWAY_HTTP_ADDR
+#    9180   health  /healthz /readyz /version /metrics  GATEWAY_HEALTH_ADDR
+#
+#  All three probe endpoints live on the health port, which is also the port
+#  Prometheus scrapes — that is why the Service below publishes it even though
+#  nothing outside the cluster should ever call it.
+#
+#  This is the only object in deploy/k8s with a NodePort, which is what "only the
+#  gateway is reachable from outside" means in practice; scripts/kind-up.sh maps
+#  host 8080 onto node port 30080 so the API is reachable at
+#  http://localhost:8080 without an ingress controller. In a managed cluster,
+#  replace the NodePort with an Ingress (or a LoadBalancer Service) and leave the
+#  NetworkPolicy exactly as it is: it allows traffic from anywhere to 8080, and
+#  how that traffic arrives is an ingress-controller decision, not a policy one.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # The initial value. Once the HorizontalPodAutoscaler below adopts this
+  # Deployment it owns the replica count; 2 matches the HPA's minReplicas so a
+  # fresh apply does not fight it.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # The edge never goes below its current capacity during a rollout: a new
+      # pod must be Ready before an old one is terminated. With the PDB and two
+      # replicas this is what keeps `kubectl rollout restart` invisible to
+      # customers, at the cost of one extra pod per deploy.
+      maxUnavailable: 0
+      maxSurge: 1
+  # A pod is only counted as available after it has been Ready for this long,
+  # which stops a pod that is about to fail its first real request (a bad config,
+  # a missing secret key) from taking traffic during a rollout.
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: edge
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      # Nothing in the image talks to the API server, so it gets no token to
+      # steal. That is a smaller credential surface than the default.
+      automountServiceAccountToken: false
+      # bootstrap.DefaultShutdownTimeout is 15s: on SIGTERM the service stops
+      # accepting, drains in-flight requests, and exits. The kubelet's grace
+      # period is set above that so the service, not SIGKILL, decides when it is
+      # done — a grace period shorter than the service's own drain window turns a
+      # clean shutdown into a truncated one.
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        # gcr.io/distroless/static-debian12:nonroot already runs as uid/gid
+        # 65532. Restating it here is deliberate duplication (the Dockerfile does
+        # the same in `USER nonroot:nonroot`): it is the manifest, not the base
+        # image, that a cluster administrator audits, and it survives a base
+        # image change.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas over nodes so that losing one node cannot take out every
+      # copy of the edge. ScheduleAnyway, not DoNotSchedule, on purpose: a
+      # DoNotSchedule constraint with maxSkew 1 needs a second node, so on a
+      # single-node kind cluster the second replica would sit Pending forever. In
+      # a multi-AZ cluster, switch this to DoNotSchedule (or add required
+      # anti-affinity) to make the spread a guarantee rather than a preference.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: gateway
+          # One Dockerfile, seven services: the image name is per service and the
+          # only difference between them is the SERVICE build arg. The tag is set
+          # in kustomization.yaml (images:), which is the single place to point
+          # this at a registry and a commit sha.
+          image: marketplace/gateway:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 9180
+              protocol: TCP
+          envFrom:
+            # The shared, non-secret half of .env.example.
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "gateway"
+            # --- its own listen addresses (compose sets these in the gateway block)
+            - name: GATEWAY_HTTP_ADDR
+              value: ":8080"
+            - name: GATEWAY_HEALTH_ADDR
+              value: ":9180"
+            # --- edge knobs from .env.example, under the names the gateway
+            # actually reads. The rate limit is a property of the edge as a
+            # whole, so it is configured unprefixed, exactly as .env.example and
+            # compose spell it.
+            - name: RATE_LIMIT_RPS
+              value: "50"
+            - name: RATE_LIMIT_BURST
+              value: "100"
+            - name: GATEWAY_REQUEST_TIMEOUT
+              value: "5s"
+            # --- the signing key, by key rather than by envFrom: the gateway needs
+            # JWT_SECRET and nothing else out of that Secret, and it has no
+            # business holding a database password.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: JWT_SECRET
+          # ------------------------------------------------------------ probes
+          #
+          # The service serves /healthz (liveness), /readyz (readiness) and
+          # /version on the dedicated health port. Compose uses
+          # `/service -health-check` for the same purpose because a distroless
+          # image has no shell to run curl from; Kubernetes can speak HTTP
+          # itself, so the probes go straight at the endpoint the binary probes.
+          #
+          # Durations:
+          #   * startup — /readyz, 5s x 12 = 60s. Gates the other two probes, so
+          #     a cold node (image pull, first page-in of the binary) cannot have
+          #     liveness restart a process that was merely still starting.
+          #   * readiness — every 5s, 3 failures to remove from rotation. Fast,
+          #     because a wrong answer here costs a 502 for real traffic.
+          #   * liveness — every 10s, 3 failures. Slow, because the only thing it
+          #     detects is a wedged process and restarting a busy replica is
+          #     disruptive. It asks /healthz, never /readyz: a dependency outage
+          #     must not restart the edge, it must only remove it from rotation
+          #     (the circuit breaker is what keeps it serving).
+          #   * timeoutSeconds 3 — the readiness checker bounds each dependency
+          #     check at 2s (pkg/health), so a 3s probe timeout lets the process
+          #     answer 503 with the failing check named, instead of the kubelet
+          #     timing out and reporting nothing at all.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # --------------------------------------------------------- resources
+          #
+          # How the numbers were chosen (the same rule is applied to every
+          # service; only the figures differ):
+          #   * requests = the steady-state working set. A Go HTTP edge with no
+          #     request in flight is one binary and a few goroutine stacks; 128MiB
+          #     is headroom over that, and 100m CPU is enough to be scheduled on a
+          #     busy node without waiting.
+          #   * limits = roughly 3x requests. Go's GC targets a multiple of the
+          #     *live* heap, so a burst of concurrent checkouts can double the
+          #     resident set between collections; a limit equal to the request
+          #     would turn that burst into an OOM kill. The gateway gets the
+          #     largest share because JSON encoding and JWT verification are the
+          #     only CPU-bound work in the stack.
+          #   * requests are deliberately below limits: setting them equal makes
+          #     every pod a guaranteed overcommit and invites node-level eviction.
+          #
+          # These are starting points, not measurements — the first thing to do
+          # after a real deployment is to compare them with
+          # container_memory_working_set_bytes and container_cpu_cfs_throttled
+          # from the ServiceMonitor-less scrape config in prometheus.yaml.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 384Mi
+          securityContext:
+            # The image is a static binary on distroless: it writes nothing to
+            # disk (migrations are embedded and applied over the network), needs
+            # no Linux capabilities, and cannot elevate. A read-only root
+            # filesystem therefore costs it nothing and removes the "write a
+            # payload, exec it" step from a compromise.
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # NodePort is the one concession to running without an ingress controller.
+  # Everything else in this namespace is ClusterIP.
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080
+      protocol: TCP
+    # Published so Prometheus can scrape /metrics by service name, and so the
+    # gateway has one stable address for probes. It is a ClusterIP port: the
+    # NodePort above applies to `http` only.
+    - name: health
+      port: 9180
+      targetPort: health
+      protocol: TCP

@@ -1,0 +1,186 @@
+# =============================================================================
+#  order — the saga orchestrator: step execution, compensation, recovery.
+#
+#  Ports (deploy/docker-compose.yml, .env.example):
+#    9094   grpc    called by the gateway, and only by the gateway  ORDER_GRPC_ADDR
+#    9194   health  /healthz /readyz /version /metrics              ORDER_HEALTH_ADDR
+#
+#  This is the most consequential pod in the stack, and the only one that needs a
+#  generous startupProbe. It is also the one service with an argument for two
+#  replicas that is not just availability: see the comment on `replicas`.
+#
+#  It is the only service that reads a database, calls three other services and
+#  publishes to Kafka — which is exactly the set of egress rules its NetworkPolicy
+#  grants, and no more.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: order
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  # Two replicas, and not only for availability:
+  #   * the recovery worker scans for stuck sagas on an interval and resumes them;
+  #     two workers racing over the same saga is normal and safe, because the saga
+  #     store saves with optimistic concurrency (the version is in the UPDATE's
+  #     WHERE clause) and the loser gets ErrVersionConflict, which the recovery
+  #     loop counts as "someone else claimed it" rather than as a failure;
+  #   * PostgreSQL migrations take an advisory lock keyed by service name, so the
+  #     second replica blocks behind the first and then finds the work done. That
+  #     is the reason the startupProbe below is measured in minutes.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order
+      app.kubernetes.io/part-of: marketplace
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: marketplace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: order
+              app.kubernetes.io/part-of: marketplace
+      containers:
+        - name: order
+          image: marketplace/order:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9094
+              protocol: TCP
+            - name: health
+              containerPort: 9194
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: marketplace-config
+          env:
+            - name: SERVICE_NAME
+              value: "order"
+            - name: ORDER_GRPC_ADDR
+              value: ":9094"
+            - name: ORDER_HEALTH_ADDR
+              value: ":9194"
+            - name: ORDER_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: marketplace-secrets
+                  key: ORDER_DB_DSN
+          # ------------------------------------------------------------ probes
+          #
+          # THIS IS THE ONE SERVICE WHERE THE STARTUP BUDGET MATTERS.
+          #
+          # order applies its embedded SQL migrations at startup, under a
+          # PostgreSQL advisory lock keyed by service name. Three consequences:
+          #
+          #   1. the first replica may be applying DDL for tens of seconds on a
+          #      fresh database;
+          #   2. the second replica blocks on the advisory lock and is not ready
+          #      until the first has finished — several minutes is a legitimate
+          #      startup time, not a hang;
+          #   3. killing a pod mid-migration is the outcome to avoid. The lock is
+          #      released when the connection dies, so the next replica starts the
+          #      same migration from the top of the unfinished file — which is
+          #      fine for idempotent DDL and not fine for anything else.
+          #
+          # So: startupProbe periodSeconds 10 x failureThreshold 30 = 300s, and
+          # the liveness probe does not run until that window has passed. A
+          # default 3-failures-at-10s liveness probe would kill this pod during a
+          # perfectly healthy first migration, forever, in a CrashLoopBackOff.
+          #
+          # Readiness still uses /readyz, so no traffic is routed here until the
+          # database check passes; liveness still uses /healthz, so a dependency
+          # outage removes the pod from rotation without restarting it.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30        # 300s: first migration + advisory lock wait
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # --------------------------------------------------------- resources
+          #
+          # The largest request in the stack. In steady state this process holds a
+          # PostgreSQL connection pool, the outbox poller, the recovery worker and
+          # the saga engine's in-flight instances — several times the footprint of
+          # a stateless backend. 128MiB is the request, 384MiB the limit, on the
+          # same "limit ≈ 3x request for Go's live-heap multiple" rule as the
+          # gateway. Raising the DB pool size must raise the memory limit in the
+          # same change: each connection costs its own buffers on both sides.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 384Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+  namespace: marketplace
+  labels:
+    app.kubernetes.io/name: order
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: marketplace
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: order
+    app.kubernetes.io/part-of: marketplace
+  ports:
+    - name: grpc
+      port: 9094
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 9194
+      targetPort: health
+      protocol: TCP
