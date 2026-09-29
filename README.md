@@ -84,6 +84,31 @@ demo shows, and what these tests cover, is the part of the system most likely to
 - eight concurrent retries of one checkout — exactly one order and exactly one charge;
 - a retry with the same idempotency key — the original order replayed, not a second one.
 
+## Load test
+
+`make k6` drives a mixed checkout profile — 70% approved, 20% permanently
+declined, 10% transient — so the compensation path runs under load rather than
+only in unit tests. A steady run:
+
+| | |
+|---|---|
+| orders confirmed | 3198 |
+| orders rolled back | 1377 (the declined cards, as intended) |
+| sagas needing a human | **0** |
+| server errors | **0** |
+| checkout latency | p95 421 ms, p99 458 ms |
+| throughput | ~27 checkouts/s |
+
+The throughput figure is bounded by the container runtime's port forwarding on a
+laptop, not by the services: no service exceeded 5% CPU during the run. The
+latency and correctness figures are the meaningful ones.
+
+Three real defects were found by running it, none of which any unit test had
+covered — see the commit history. The most instructive: the address-based rate
+limiter was applied to every route, so it throttled authenticated checkouts to
+the allowance meant for a human logging in. A load test from one address hit it
+immediately; so would every customer behind a corporate NAT.
+
 ## Try it
 
 With the stack up:

@@ -1353,3 +1353,68 @@ func TestCreateOrder_FailureMessageIsFitForACustomer(t *testing.T) {
 		t.Errorf("order = %v, want it cancelled and reported", res.Order)
 	}
 }
+
+func TestCompensation_ReleasesAStockHoldThatWasNeverRecorded(t *testing.T) {
+	// The case CompensateOnFailure exists for: the reserve timed out, so the
+	// hold may exist but the id was never written back. Reaching for Require
+	// here turned that into a compensation failure — the hold leaked *and* the
+	// saga needed a human, which is the worst of both.
+	//
+	// It was found by running the checkout load test until the demo stock ran
+	// out and reserves began to fail. No unit test had covered it, because the
+	// fakes always succeeded at reserving.
+	h := newHarness(t)
+	h.payments.decline = true
+	h.payments.retryable = false
+
+	// Reserve fails permanently, as it does once the stock ledger is empty.
+	h.inventory.failReserve = 99
+
+	res, _ := h.service.CreateOrder(context.Background(), h.request("unrecorded-hold"))
+
+	if res.Order == nil {
+		t.Fatal("no order was returned; a rollback must still name what it rolled back")
+	}
+	if res.Order.Status != domain.StatusCancelled {
+		t.Fatalf("status = %s, want cancelled: a failed reserve must roll back cleanly", res.Order.Status)
+	}
+
+	// The compensation must have been attempted against the deterministic id,
+	// which is the order id.
+	calls := h.inventory.callLog()
+	if !slices.Contains(calls, "release") {
+		t.Errorf("calls = %v, want the compensation to have run", calls)
+	}
+
+	// And the saga must not be left needing a human.
+	if res.SagaStatus == saga.StatusFailed {
+		t.Error("the saga ended in failed; a reserve that never applied must compensate cleanly")
+	}
+}
+
+func TestCompensation_UsesTheRecordedIdWhenItExists(t *testing.T) {
+	// The deterministic id is a fallback, not a replacement. When the step did
+	// record what it produced, that is the value to use: it is the authoritative
+	// answer, and a future provider that assigns its own ids would break if the
+	// compensation ignored it.
+	h := newHarness(t)
+	h.payments.decline = true
+	h.payments.retryable = false
+
+	res, _ := h.service.CreateOrder(context.Background(), h.request("recorded-hold"))
+
+	if res.Order == nil {
+		t.Fatal("no order was returned")
+	}
+
+	held := h.inventory.reservationFor(res.Order.ID)
+	if held == nil {
+		t.Fatal("no reservation was created")
+	}
+	if held.status != "released" {
+		t.Errorf("reservation status = %s, want released", held.status)
+	}
+	if held.release == "" {
+		t.Error("the release carries no reason; the audit trail should say why")
+	}
+}

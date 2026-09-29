@@ -204,9 +204,22 @@ func (c *CheckoutSaga) reserveStock(ctx context.Context, s *saga.Session) error 
 // releaseStock returns a hold to the pool. It is the compensation for
 // reserveStock.
 func (c *CheckoutSaga) releaseStock(ctx context.Context, s *saga.Session) error {
-	reservationID, err := s.Require(keyReservationID)
-	if err != nil {
-		return err
+	// The reservation id is derived, not required.
+	//
+	// reserveStock records it, but the step declares CompensateOnFailure because
+	// a reserve that timed out may still have taken the hold — and in exactly
+	// that case the recorded value is missing. Reaching for Require here was a
+	// bug: it turned the situation the flag exists for into a compensation
+	// failure, which is the worst possible outcome, because the hold is then
+	// leaked *and* the saga needs a human.
+	//
+	// The fix is available because the id is deterministic: the order service
+	// passes its own order id as the reservation id, so the compensation can
+	// always reconstruct it. Releasing a reservation that was never created is a
+	// documented no-op, so this is safe whether or not the forward step applied.
+	reservationID := s.ID()
+	if recorded, ok := s.Get(keyReservationID); ok && recorded != "" {
+		reservationID = recorded
 	}
 
 	reason := "checkout_failed"

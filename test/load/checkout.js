@@ -13,9 +13,16 @@
 import http from 'k6/http';
 import { check, sleep, group } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
-import { randomString } from 'https://jspm.dev/uuid';
 
 const BASE = __ENV.BASE_URL || 'http://localhost:8081';
+
+// Identifiers are generated locally rather than imported from a CDN. A load
+// test that cannot start because someone else's host is down is measuring the
+// wrong thing, and the test runner should not depend on the network any more
+// than the system under test does.
+function uniqueId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 // Domain metrics, so the report separates outcomes rather than lumping every
 // non-201 into "failed". A declined card is the system working.
@@ -24,6 +31,11 @@ const ordersRolledBack = new Counter('checkout_rolled_back');
 const ordersNeedingHuman = new Counter('checkout_needs_human');
 const sagaLatency = new Trend('checkout_saga_duration', true);
 const unexpected = new Rate('checkout_unexpected');
+// Transport-level failures only. k6's own `http_req_failed` counts every status
+// at or above 400, which lumps a declined card (422) in with a server fault —
+// and a load test whose failure threshold is crossed by the system working
+// correctly is a threshold nobody will keep.
+const serverErrors = new Counter('checkout_server_errors');
 
 export const options = {
   scenarios: {
@@ -52,10 +64,13 @@ export const options = {
     // result as immediate.
     'http_req_duration{route:create_order}': ['p(95)<500', 'p(99)<1500'],
 
-    // Failures here would be transport-level: a 5xx, a connection error, a
-    // timeout. A 422 is a declined card and is expected, so it is excluded by
-    // being counted as a separate outcome rather than a request failure.
-    'http_req_failed{route:create_order}': ['rate<0.02'],
+    // The failure budget is on the *system*, not on the business. A 422 is a
+    // declined card: the saga rolled back, the customer was charged nothing and
+    // the stock went back to the pool. The script sends 20% declines and 10%
+    // timeouts on purpose, so roughly a third of responses are 422 and a
+    // threshold on http_req_failed would be crossed by correct behaviour.
+    'checkout_server_errors': ['count<10'],
+    'checkout_unexpected': ['rate<0.001'],
 
     // If any saga needs a human during a normal load run, something is wrong
     // that a latency threshold would not have caught.
@@ -67,7 +82,7 @@ export const options = {
 
 // setup runs once and shares its result with every VU.
 export function setup() {
-  const email = `load-${randomString().slice(0, 8)}@example.com`;
+  const email = `load-${uniqueId().slice(0, 8)}@example.com`;
   const password = 'load-test-password-32-bytes-long';
 
   const register = http.post(
@@ -111,7 +126,7 @@ export default function (data) {
     Authorization: `Bearer ${data.token}`,
     // Unique per request. Reusing a key would measure the idempotency replay
     // instead of the checkout, which is a different and much cheaper path.
-    'Idempotency-Key': randomString(),
+    'Idempotency-Key': uniqueId(),
   };
 
   const body = JSON.stringify({
@@ -166,6 +181,9 @@ export default function (data) {
 
   // Anything else — 500, 503, a connection reset — is unexpected.
   unexpected.add(1);
+  if (response.status >= 500 || response.status === 0) {
+    serverErrors.add(1);
+  }
 }
 
 export function teardown(data) {

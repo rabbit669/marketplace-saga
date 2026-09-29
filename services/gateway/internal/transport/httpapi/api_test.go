@@ -14,6 +14,7 @@ import (
 
 	"github.com/marketplace/pkg/apperr"
 	"github.com/marketplace/pkg/jwtx"
+	authv1 "github.com/marketplace/pkg/proto/auth/v1"
 	commonv1 "github.com/marketplace/pkg/proto/common/v1"
 	orderv1 "github.com/marketplace/pkg/proto/order/v1"
 	"github.com/marketplace/pkg/ratelimit"
@@ -72,6 +73,37 @@ func (f *fakeOrders) RetrySaga(context.Context, *orderv1.RetrySagaRequest, ...gr
 	return nil, nil
 }
 
+// fakeAuth is a stub identity service.
+//
+// The public routes are only registered when an auth client is configured, so
+// without this the address limiter would have nothing to protect and the test
+// would pass for the wrong reason.
+type fakeAuth struct{}
+
+func (fakeAuth) Register(context.Context, *authv1.RegisterRequest, ...grpc.CallOption) (*authv1.RegisterResponse, error) {
+	return &authv1.RegisterResponse{User: &authv1.User{Id: "u-1"}}, nil
+}
+
+func (fakeAuth) Login(context.Context, *authv1.LoginRequest, ...grpc.CallOption) (*authv1.LoginResponse, error) {
+	return nil, apperr.Unauthenticated("auth", "email or password is incorrect")
+}
+
+func (fakeAuth) Refresh(context.Context, *authv1.RefreshRequest, ...grpc.CallOption) (*authv1.RefreshResponse, error) {
+	return nil, apperr.Unauthenticated("auth", "refresh token is not valid")
+}
+
+func (fakeAuth) Logout(context.Context, *authv1.LogoutRequest, ...grpc.CallOption) (*authv1.LogoutResponse, error) {
+	return &authv1.LogoutResponse{}, nil
+}
+
+func (fakeAuth) ValidateToken(context.Context, *authv1.ValidateTokenRequest, ...grpc.CallOption) (*authv1.ValidateTokenResponse, error) {
+	return &authv1.ValidateTokenResponse{Valid: false}, nil
+}
+
+func (fakeAuth) GetUser(context.Context, *authv1.GetUserRequest, ...grpc.CallOption) (*authv1.GetUserResponse, error) {
+	return nil, apperr.NotFound("auth", "no such user")
+}
+
 // --------------------------------------------------------------- harness
 
 const testSecret = "test-secret-must-be-at-least-32-bytes-long"
@@ -100,6 +132,7 @@ func newHarness(t *testing.T, cfg func(*httpapi.Config)) *harness {
 		},
 		RateLimit:   ratelimit.Config{PerSecond: 1000, Burst: 1000},
 		OrderClient: h.orders,
+		AuthClient:  fakeAuth{},
 	}
 	if cfg != nil {
 		cfg(&c)
@@ -547,3 +580,45 @@ func decodeError(t *testing.T, rec *httptest.ResponseRecorder) errorEnvelope {
 }
 
 var commonMoney = &commonv1.Money{AmountMinor: 4999, Currency: "USD"}
+
+func TestRateLimit_DoesNotThrottleAuthenticatedRoutesByAddress(t *testing.T) {
+	// The regression this guards: the address limiter was in the global chain,
+	// so it covered authenticated routes too. It is sized for a human logging in
+	// (a few requests per second), so a load test from one address had thousands
+	// of checkouts rejected with 429 — and so would every customer behind a
+	// corporate NAT, which is the same situation with worse consequences.
+	h := newHarness(t, func(c *httpapi.Config) {
+		// Tight, so the test does not have to send hundreds of requests.
+		c.AuthRateLimit = ratelimit.Config{PerSecond: 1, Burst: 1}
+		c.RateLimit = ratelimit.Config{PerSecond: 1000, Burst: 1000}
+	})
+	h.orders.createResp = &orderv1.CreateOrderResponse{
+		Order:      &orderv1.Order{Id: "o-1", Status: orderv1.OrderStatus_ORDER_STATUS_CONFIRMED},
+		SagaStatus: orderv1.SagaStatus_SAGA_STATUS_COMPLETED,
+	}
+
+	token := h.token(t, "cust-1")
+
+	// The address budget is spent immediately by the first call...
+	for range 5 {
+		if rec := h.createOrder(t, token, "key-x", validOrderBody); rec.Code == http.StatusTooManyRequests {
+			t.Fatal("an authenticated checkout was throttled by the address limiter")
+		}
+	}
+
+	// ...and the unauthenticated route is still limited by it.
+	login := httptest.NewRequest(http.MethodPost, "/v1/auth/login",
+		strings.NewReader(`{"email":"a@example.com","password":"whatever"}`))
+	login.Header.Set("Content-Type", "application/json")
+
+	throttled := false
+	for range 5 {
+		if h.do(t, login).Code == http.StatusTooManyRequests {
+			throttled = true
+			break
+		}
+	}
+	if !throttled {
+		t.Error("login was never throttled; the address limiter is not protecting it")
+	}
+}

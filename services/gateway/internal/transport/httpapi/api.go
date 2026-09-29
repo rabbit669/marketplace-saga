@@ -109,7 +109,12 @@ func NewServer(cfg Config) (*Server, error) {
 //	recovery    — a panic anywhere below becomes a 500
 //	logging     — records the final status, including 500s from recovery
 //	timeout     — bounds the handler, not the middleware
-//	rate limit  — keyed by address, which is all that is known before auth
+//
+// Rate limiting is not in this chain. It is applied per route, because the two
+// limiters key on different things: the address for the unauthenticated routes,
+// the customer for everything behind authentication. A single global limiter can
+// only key on one of them, and keying on the address throttles every customer
+// behind a shared one to the allowance meant for a person logging in.
 //
 // Authentication is not here: it is applied to the routes that need it, so that
 // registration and login stay reachable.
@@ -135,11 +140,18 @@ func (s *Server) Handler() http.Handler {
 		return withAuth(s.cfg.JWT, s.log)(withRateLimit(s.limiter, "customer")(h))
 	}
 
-	// Public.
+	// Public. These are limited by address, because there is no caller identity
+	// yet — and login is the endpoint an attacker brute-forces.
+	//
+	// The address limiter is applied *here* rather than to the whole mux. Putting
+	// it in the global chain made it cover authenticated routes too, and since it
+	// is sized for a human logging in rather than for a service, a checkout load
+	// test from a single address had 11k of its requests rejected with 429. That
+	// is also what every real client behind a corporate NAT would have hit.
 	if s.auth != nil {
-		mux.Handle("POST /v1/auth/register", route(s.handleRegister()))
-		mux.Handle("POST /v1/auth/login", route(s.handleLogin()))
-		mux.Handle("POST /v1/auth/refresh", route(s.handleRefresh()))
+		mux.Handle("POST /v1/auth/register", route(withRateLimit(s.authLimiter, "address")(s.handleRegister())))
+		mux.Handle("POST /v1/auth/login", route(withRateLimit(s.authLimiter, "address")(s.handleLogin())))
+		mux.Handle("POST /v1/auth/refresh", route(withRateLimit(s.authLimiter, "address")(s.handleRefresh())))
 	}
 
 	// Authenticated.
@@ -160,7 +172,6 @@ func (s *Server) Handler() http.Handler {
 		withRecovery(s.log),
 		withLogging(s.log),
 		withTimeout(s.cfg.RequestTimeout),
-		withRateLimit(s.authLimiter, "address"),
 	)
 }
 

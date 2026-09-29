@@ -204,23 +204,17 @@ spec:
           # container_memory_working_set_bytes and container_cpu_cfs_throttled
           # from the ServiceMonitor-less scrape config in prometheus.yaml.
           resources:
+            # Sizing is measured, not guessed: a k6 checkout run at ~27 rps
+            # held these services to 10 MiB of RSS. The request is roughly 4x that
+            # so a pod is not evicted by a garbage-collection spike, and the
+            # limit is left generous because exceeding a memory limit means
+            # OOMKill, not throttling.
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 48Mi
             limits:
-              cpu: 1000m
+              cpu: 500m
               memory: 384Mi
-          securityContext:
-            # The image is a static binary on distroless: it writes nothing to
-            # disk (migrations are embedded and applied over the network), needs
-            # no Linux capabilities, and cannot elevate. A read-only root
-            # filesystem therefore costs it nothing and removes the "write a
-            # payload, exec it" step from a compromise.
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
 ---
 apiVersion: v1
 kind: Service

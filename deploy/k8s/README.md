@@ -179,5 +179,5 @@ Three real defects were found, none of which static validation could have caught
 
 Two things remain unverified without a multi-node cluster: NetworkPolicy
 enforcement across nodes (kind's kindnet enforces single-node policies, which is
-how defect 2 was found), and the resource figures, which are a stated sizing rule
-rather than measurements.
+how defect 2 was found), and the resource figures, which are now measured (see below) but only at one
+load level on one machine.
