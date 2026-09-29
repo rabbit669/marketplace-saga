@@ -24,6 +24,12 @@ type Metrics interface {
 	EventOutcome(kind, outcome string)
 }
 
+// sagaDataDeclinedReason is the session key under which the checkout saga
+// records the provider's decline reason. It is duplicated here rather than
+// imported so that this file does not reach into the saga's private keys; the
+// two are kept in step by the test that asserts the message a customer sees.
+const sagaDataDeclinedReason = "declined_reason"
+
 // Service implements the order service's use cases.
 type Service struct {
 	orders   domain.Repository
@@ -529,11 +535,27 @@ func checkoutFailure(inst *saga.Instance, sagaErr error) *apperr.Error {
 	return apperr.FailedPrecondition("order.CreateOrder", "checkout could not be completed: %s", reason)
 }
 
-// reasonFromSaga extracts the most specific reason available.
+// reasonFromSaga extracts the most specific reason a customer can be shown.
+//
+// The step's LastError is a diagnostic, not a message: it reads
+// "saga <uuid> step authorize_payment: failed after 1 attempt(s):
+// payment.Authorize: failed_precondition: payment declined: insufficient_funds".
+// Handing that to a customer leaks internal identifiers, the step name and the
+// attempt count, and says "declined" twice.
+//
+// The checkout saga records the provider's own reason separately for exactly
+// this purpose, so it is preferred when present. The wrapped error is the
+// fallback for steps that have no such notion — an inventory failure, say —
+// where the diagnostic is at least the truth, even if it is verbose.
 func reasonFromSaga(inst *saga.Instance) string {
 	if inst == nil {
 		return "unknown"
 	}
+
+	if reason, ok := inst.Data[sagaDataDeclinedReason]; ok && reason != "" {
+		return strings.ReplaceAll(reason, "_", " ")
+	}
+
 	for _, step := range inst.Steps {
 		if step.LastError != "" {
 			return step.LastError

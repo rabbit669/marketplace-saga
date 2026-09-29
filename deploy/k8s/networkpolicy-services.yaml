@@ -114,6 +114,21 @@ spec:
       ports:
         - protocol: TCP
           port: 9092
+    # FLOW ENABLED: gateway -> redis:6379 (shared rate-limit buckets).
+    #
+    # Both halves of this rule were needed and both were missing when the limiter
+    # moved out of process memory: the redis policy has to admit the gateway, and
+    # the gateway's egress has to admit redis. With only the first, the symptom
+    # was a readiness probe failing with a dial timeout — which reads like a
+    # broken cache and is actually a policy that was written when the code did
+    # something else.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
 ---
 # -----------------------------------------------------------------------------
 #  auth

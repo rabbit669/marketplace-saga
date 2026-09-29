@@ -22,6 +22,13 @@ metadata:
     app.kubernetes.io/part-of: marketplace
 spec:
   clusterIP: None
+  # Without this, a headless service publishes DNS records only for *ready*
+  # pods, and a single-node KRaft broker has a deadlock: it cannot become ready
+  # until it resolves its own advertised name, and the name does not resolve
+  # until it is ready. The symptom is `java.net.UnknownHostException: kafka`
+  # followed by CrashLoopBackOff, which looks like a configuration error and is
+  # actually a chicken-and-egg in the service definition.
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: kafka
     app.kubernetes.io/part-of: marketplace

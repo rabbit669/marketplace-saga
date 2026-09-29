@@ -92,7 +92,6 @@ services:
       AUTH_GRPC_ADDR: :9091
       AUTH_HEALTH_ADDR: :9191
       AUTH_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${AUTH_DB_NAME:-auth_db}?sslmode=disable
-      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
       JWT_ISSUER: ${JWT_ISSUER:-marketplace}
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
@@ -119,7 +118,6 @@ services:
       CATALOG_GRPC_ADDR: :9092
       CATALOG_HEALTH_ADDR: :9192
       CATALOG_DB_DSN: postgres://${POSTGRES_USER:-marketplace}:${POSTGRES_PASSWORD:-marketplace}@postgres:5432/${CATALOG_DB_NAME:-catalog_db}?sslmode=disable
-      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
       KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
     healthcheck:
       <<: *healthcheck

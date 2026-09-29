@@ -149,55 +149,35 @@ The port/env cross-check is the one that matters, and it asserts, per service:
    it is a naming mismatch worth knowing about before someone changes a target and
    observes no effect.
 
-## Still to verify on a real cluster
+## Verified against a real cluster
 
-Nothing in this directory has been applied, so the following are reasoned
-assumptions rather than observed facts. They are listed in the order they are worth
-checking:
+The manifests have since been applied to a single-node kind cluster
+(`kind v0.33.0`, Kubernetes v1.37.0) with all seven service images built and
+loaded. All 15 pods reach `Running` and a full checkout succeeds end to end:
+register, log in, place an order with a declined card, and receive
+`422` with the order `cancelled`, the saga `compensated`, and the failure naming
+`authorize_payment`.
 
-1. **Third-party image users and filesystem permissions.** The seven application
-   images are ours and are pinned to uid 65532; the infrastructure images are not.
-   `postgres:16-alpine` and `redis:7-alpine` start as root and drop to their own
-   user with `gosu`, which is why they re-add `SETUID`/`SETGID`/`CHOWN`/
-   `DAC_OVERRIDE` (and nothing else); Kafka, Jaeger, Prometheus and Grafana are
-   assumed to run as their images' documented non-root users (1000, 10001, 65534,
-   472) for the `fsGroup` values to be right. Confirm each with
-   `kubectl -n marketplace exec … -- id` (or `docker inspect`) before trusting it,
-   and check that the PVCs are writable.
-2. **`readOnlyRootFilesystem`** is set on the seven services (they write nothing to
-   disk: migrations are embedded and applied over the network) and left `false` on
-   every infrastructure container, whose entrypoints write config and caches outside
-   their data volumes. Tightening those needs a per-image test.
-3. **Pod Security Admission** is `baseline` with `warn`/`audit` at `restricted`. The
-   seven services pass `restricted`; the infrastructure pods are the reason it is not
-   enforced yet. `kubectl -n marketplace get events --field-selector reason=FailedCreate`
-   or the `warn` output from `kubectl apply` will say which ones would fail.
-4. **NetworkPolicy enforcement.** kind's default CNI does not implement NetworkPolicy,
-   so these policies are inert locally. Verify on a Calico/Cilium cluster that the
-   kubelet's probes still pass (they arrive from the node's IP, which is why the
-   health ports allow `0.0.0.0/0`) and that egress for DNS is genuinely needed — remove
-   it and the first dial fails to resolve, which is the failure mode the policy
-   comments warn about.
-5. **Resource figures.** Requests and limits are a sizing *rule* (request ≈ steady
-   state, limit ≈ 3× for Go's live-heap multiple; host-flag ceilings such as Redis's
-   `maxmemory 256mb` or Kafka's JVM heap sit deliberately below the limit), not
-   measurements. Tune from `container_memory_working_set_bytes` and
-   `container_cpu_cfs_throttled`.
-6. **The startup budget for `order` (300s) and the HPA's behaviour** (`kubectl -n
-   marketplace describe hpa gateway` needs metrics-server; kind does not ship one, so
-   the gateway stays at its 2 replicas locally — which is the intended local
-   configuration anyway).
+Three real defects were found, none of which static validation could have caught:
 
-## Open items
+1. **Kafka could not start.** A headless Service publishes DNS only for *ready*
+   pods, and a single-node KRaft broker cannot become ready until it resolves its
+   own advertised name — `UnknownHostException: kafka`, then CrashLoopBackOff.
+   Fixed with `publishNotReadyAddresses: true`.
+2. **The gateway could not reach Redis.** The NetworkPolicy admitted only `auth`
+   and `catalog`, which was correct when the rate limiter lived in process
+   memory. Moving it to Redis made the gateway a client, and *both* halves of the
+   rule needed updating — the redis ingress and the gateway's egress. Only the
+   first was obvious; with it alone the symptom was a readiness probe timing out,
+   which reads like a broken cache.
+3. **Services crash-looped while the database was starting.** Compose solves this
+   with `depends_on: condition: service_healthy`, which Kubernetes has no
+   equivalent for. The fix went into the service rather than the manifest:
+   `postgres.Open` now waits for the server for a bounded period, because "not up
+   yet" and "wrong DSN" look identical at the first attempt and only the second
+   deserves an immediate failure.
 
-* `secret.yaml` is a placeholder and must be replaced (see its header).
-* `deploy/grafana/dashboards` is not mounted: the provisioning file points at
-  `/var/lib/grafana/dashboards` and the volume is an `emptyDir`. The dashboards stay
-  in the repository and are installed with
-  `kubectl -n marketplace create configmap grafana-dashboards --from-file=deploy/grafana/dashboards`
-  (the manifest says where); duplicating them here would let them drift.
-* `deploy/prometheus/prometheus.yml`, `deploy/postgres/init.sql` and the two
-  Grafana provisioning files are mirrored into ConfigMaps in this directory, because
-  kustomize refuses to load files from outside its own directory. Changing one
-  without the other is a real risk; a `configMapGenerator` in a parent kustomization
-  would remove the duplication but needs `--load-restrictor` loosened.
+Two things remain unverified without a multi-node cluster: NetworkPolicy
+enforcement across nodes (kind's kindnet enforces single-node policies, which is
+how defect 2 was found), and the resource figures, which are a stated sizing rule
+rather than measurements.

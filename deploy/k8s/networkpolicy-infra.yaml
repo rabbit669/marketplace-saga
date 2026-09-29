@@ -86,14 +86,17 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # FLOW ENABLED: auth and catalog -> redis:6379.
+    # FLOW ENABLED: gateway -> redis:6379.
+    #
+    # The gateway holds the shared rate-limit buckets. It replaced auth and
+    # catalog here when the limiter moved out of process memory: a NetworkPolicy
+    # is a contract that a code change can silently break, and this one was only
+    # found by applying the manifests to a real cluster. Statically the policy
+    # was correct — it matched what compose passed — it was the code that moved.
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: auth
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: catalog
+              app.kubernetes.io/name: gateway
       ports:
         - protocol: TCP
           port: 6379

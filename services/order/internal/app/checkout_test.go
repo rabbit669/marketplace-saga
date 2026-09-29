@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1311,5 +1312,44 @@ func TestCreateOrder_RecordsTheSagaOutcome(t *testing.T) {
 					tc.want, got, recorder.outcomes)
 			}
 		})
+	}
+}
+
+func TestCreateOrder_FailureMessageIsFitForACustomer(t *testing.T) {
+	// The order service records the provider's reason in the saga's data for
+	// exactly this purpose. The step's LastError is a diagnostic and reads
+	// "saga <uuid> step authorize_payment: failed after 1 attempt(s): ..." —
+	// handing that to a customer leaks identifiers and says "declined" twice.
+	h := newHarness(t)
+	h.payments.decline = true
+	h.payments.retryable = false
+
+	res, err := h.service.CreateOrder(context.Background(), h.request("message-quality"))
+	if err == nil {
+		t.Fatal("expected the checkout to fail")
+	}
+
+	message := apperr.PublicMessage(err)
+
+	// It must say what happened.
+	if !strings.Contains(message, "insufficient funds") {
+		t.Errorf("message = %q, want the provider's reason in it", message)
+	}
+
+	// It must not contain the machinery.
+	for _, leak := range []string{"saga ", "step ", "attempt", "failed_precondition", "payment.Authorize"} {
+		if strings.Contains(message, leak) {
+			t.Errorf("message leaks internal detail %q: %s", leak, message)
+		}
+	}
+
+	// And it must not repeat itself, which is what wrapping the diagnostic in
+	// another "payment was declined:" produced.
+	if strings.Count(strings.ToLower(message), "declined") > 1 {
+		t.Errorf("message says declined more than once: %s", message)
+	}
+
+	if res.Order == nil || res.Order.Status != domain.StatusCancelled {
+		t.Errorf("order = %v, want it cancelled and reported", res.Order)
 	}
 }

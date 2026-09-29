@@ -63,6 +63,7 @@ The project is built in stages; this section is kept honest as it progresses.
 | Kafka: outbox poller, deduplicating consumers, notification service | ✅ done |
 | OpenTelemetry traces across gRPC *and* Kafka | ✅ done |
 | Kubernetes manifests, GitHub Actions CI, kind scripts | ✅ done |
+| Applied to a real kind cluster: 15/15 pods running, checkout verified | ✅ done |
 | Grafana dashboard, Prometheus metrics (RED + domain) | ✅ done |
 | k6 checkout load test | ✅ done |
 | C4 diagrams in `docs/architecture.md` | ✅ done |
@@ -107,6 +108,7 @@ matters.
 
 Architecture diagrams — system context, containers, and the checkout sequence for
 both the happy path and the rollback — are in [`docs/architecture.md`](docs/architecture.md).
+The public HTTP contract is in [`docs/openapi.yaml`](docs/openapi.yaml).
 
 ## Services
 

@@ -49,6 +49,19 @@ type Config struct {
 	MaxConnIdleTime time.Duration
 	// ConnectTimeout bounds the initial dial.
 	ConnectTimeout time.Duration
+	// StartupTimeout bounds how long Open waits for the server to become
+	// reachable before giving up.
+	//
+	// It exists because "the database is not up yet" and "the DSN is wrong" are
+	// different problems that look identical at the first attempt. A compose
+	// stack solves the first with `depends_on: condition: service_healthy`;
+	// Kubernetes has no equivalent, so a service that insists on its database
+	// being ready at process start crash-loops until it happens to be.
+	//
+	// Waiting is the right answer for availability and the wrong one for a
+	// misconfiguration, so the wait is bounded: a wrong DSN still fails, just
+	// after the budget rather than immediately.
+	StartupTimeout time.Duration
 	// Logger receives pool events that pgx would otherwise swallow.
 	Logger *slog.Logger
 	// Service names the service in logs and in the migration lock key.
@@ -74,6 +87,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 5 * time.Second
+	}
+	if c.StartupTimeout <= 0 {
+		c.StartupTimeout = 60 * time.Second
 	}
 	return c
 }
@@ -110,10 +126,7 @@ func Open(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("postgres: %s: create pool: %w", cfg.Service, err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
-	defer cancel()
-
-	if err := pool.Ping(pingCtx); err != nil {
+	if err := waitForServer(ctx, pool, cfg); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("postgres: %s: cannot reach the database: %w", cfg.Service, err)
 	}
@@ -127,6 +140,53 @@ func Open(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	}
 
 	return pool, nil
+}
+
+// waitForServer pings the database until it answers or the budget runs out.
+//
+// The retries are spaced out rather than tight: a database starting up needs
+// seconds, not microseconds, and hammering it during a cold start competes with
+// the work it is trying to finish.
+func waitForServer(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
+	deadline := time.Now().Add(cfg.StartupTimeout)
+	delay := 200 * time.Millisecond
+
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
+		err := pool.Ping(pingCtx)
+		cancel()
+
+		if err == nil {
+			if attempt > 1 {
+				cfg.Logger.Info("database became reachable",
+					"service", cfg.Service, "attempts", attempt)
+			}
+			return nil
+		}
+		lastErr = err
+
+		// The caller gave up, or we are out of budget.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("gave up after %s and %d attempts: %w",
+				cfg.StartupTimeout, attempt, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+
+		// Exponential up to a second: a cold database can take tens of seconds,
+		// and a fixed short delay would spend the whole budget on failed dials.
+		if delay < time.Second {
+			delay *= 2
+		}
+	}
 }
 
 // Health returns a readiness check backed by the pool.
