@@ -266,9 +266,16 @@ h3 {
 }
 
 .price {
+  font-family: var(--font-display);
+  /* 400 like every other use of this face: it ships one weight, and a heavier
+     request makes the browser smear a fake bold over outlines that are already
+     distorted. The price keeps its size and its colour instead. */
+  font-weight: 400;
   font-size: 19px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
+  /* Tracking is zero rather than the negative it was. The face supports tnum,
+     which makes every digit the same width, and pulling that width back in
+     makes the distorted outlines collide. */
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -337,7 +344,14 @@ h3 {
   font-variant-numeric: tabular-nums;
 }
 
-.money { font-variant-numeric: tabular-nums; }
+/* Cart line totals and the cart total. Both are bare amounts, so the whole
+   element can take the display face; the labels beside them stay in the text
+   face. tabular-nums is what keeps the column aligned, and this face has it. */
+.money {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
 
 .total {
   display: flex;
@@ -351,9 +365,16 @@ h3 {
 }
 .total strong {
   font-size: 24px;
-  font-weight: 650;
+  /* The cart total is a bare amount, so it takes the display face — and the
+     display face ships one weight. This said 650, which the browser would have
+     satisfied by smearing a synthetic bold over already-distorted outlines;
+     `strong` beats `.money` on specificity, so the weight has to be fixed
+     here rather than there. Tracking goes to zero for the same reason as the
+     card price: the face has tabular figures, and squeezing their width makes
+     the outlines collide. Emphasis comes from size and colour instead. */
+  font-weight: 400;
   color: var(--text);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 
