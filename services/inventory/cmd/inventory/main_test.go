@@ -88,19 +88,18 @@ func TestSeedDemoStock(t *testing.T) {
 		t.Fatalf("seedDemoStock: %v", err)
 	}
 
-	// The checkout demo depends on these exact ids and levels, because the
-	// catalogue fixture and the demo script both name them.
-	want := map[string]int64{"p-1": 100, "p-2": 250}
-	for productID, quantity := range want {
-		items, err := store.GetStock(ctx, []string{productID})
+	// Quantities are read back from the fixture rather than restated, so this
+	// test cannot drift from the seed by simply being edited alongside it.
+	for _, seed := range demoStock {
+		items, err := store.GetStock(ctx, []string{seed.productID})
 		if err != nil {
-			t.Fatalf("GetStock(%s): %v", productID, err)
+			t.Fatalf("GetStock(%s): %v", seed.productID, err)
 		}
 		if len(items) != 1 {
-			t.Fatalf("%s was not seeded", productID)
+			t.Fatalf("%s was not seeded", seed.productID)
 		}
-		if items[0].Quantity != quantity {
-			t.Errorf("%s quantity = %d, want %d", productID, items[0].Quantity, quantity)
+		if items[0].Quantity != seed.quantity {
+			t.Errorf("%s quantity = %d, want %d", seed.productID, items[0].Quantity, seed.quantity)
 		}
 	}
 
@@ -111,6 +110,36 @@ func TestSeedDemoStock(t *testing.T) {
 	items, _ := store.GetStock(ctx, []string{"p-1"})
 	if items[0].Quantity != 100 {
 		t.Fatalf("p-1 quantity = %d after seeding twice, want 100", items[0].Quantity)
+	}
+}
+
+// TestDemoStockCoversTheCatalogueFixture guards a defect that shipped once: the
+// seed stocked only the first two products while the storefront advertised six,
+// so a shopper who added anything else watched the saga fail at reserve_stock
+// with a message that reads like an infrastructure fault.
+//
+// The ids are duplicated here on purpose. The catalogue fixture lives in another
+// module and cannot be imported, so this list is the only place the two seeds
+// are compared — which means it has to be updated by hand whenever the
+// catalogue gains a product. That is the point: the failure should be a red
+// test, not a broken checkout.
+//
+// p-6 is inactive in the catalogue fixture, so the storefront does not offer it.
+// It is stocked anyway: the cost is one row, and it means activating that
+// product cannot silently produce an unbuyable listing.
+func TestDemoStockCoversTheCatalogueFixture(t *testing.T) {
+	catalogueFixture := []string{"p-1", "p-2", "p-3", "p-4", "p-5", "p-6"}
+
+	stocked := make(map[string]struct{}, len(demoStock))
+	for _, seed := range demoStock {
+		stocked[seed.productID] = struct{}{}
+	}
+
+	for _, productID := range catalogueFixture {
+		if _, ok := stocked[productID]; !ok {
+			t.Errorf("catalogue offers %s but the demo seed stocks nothing for it; "+
+				"a checkout of that product fails at reserve_stock", productID)
+		}
 	}
 }
 

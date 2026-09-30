@@ -43,13 +43,20 @@ const (
 )
 
 // demoStock is the seed applied in development so that the checkout demo works
-// on a fresh container. The ids match the catalogue fixture.
+// on a fresh container. The ids match the catalogue fixture — all six of them:
+// stocking only the first two left the storefront advertising products that no
+// checkout could ever buy, and the saga failed at reserve_stock with a message
+// that reads like an infrastructure fault rather than a missing stock row.
 var demoStock = []struct {
 	productID string
 	quantity  int64
 }{
 	{"p-1", 100},
 	{"p-2", 250},
+	{"p-3", 180},
+	{"p-4", 320},
+	{"p-5", 90},
+	{"p-6", 400},
 }
 
 func main() {
