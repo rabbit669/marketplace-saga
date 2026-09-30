@@ -238,12 +238,16 @@ h3 {
   color: var(--text-3);
 }
 
+/* The product name, in the display face. */
 .card h4 {
   margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-  line-height: 1.35;
-  letter-spacing: -0.01em;
+  font-family: var(--font-display);
+  /* Always 400: Rubik Glitch ships a single weight, and a heavier request makes
+     the browser fake the bold by smearing the outlines. */
+  font-weight: 400;
+  font-size: 17px;
+  line-height: 1.4;
+  letter-spacing: 0;
 }
 
 .attrs {
@@ -271,9 +275,9 @@ h3 {
 /* ---------------------------------------------------------------- button */
 
 .btn {
-  font-family: var(--font-text);
-  font-size: 14.5px;
-  font-weight: 600;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 15px;
   color: var(--text);
   background: var(--surface-3);
   border: none;
@@ -293,7 +297,10 @@ h3 {
 }
 .btn-primary:hover { background: var(--accent-soft); }
 
-.btn-wide { width: 100%; padding: 13px 20px; font-size: 15.5px; }
+/* The checkout CTA, and the only wide button. A step larger than the rest: at
+   the glitch face's distortion, the default size costs more legibility than it
+   buys character on the button that has to be unmissable. */
+.btn-wide { width: 100%; padding: 13px 20px; font-size: 17px; }
 
 .link {
   color: var(--accent-soft);
@@ -317,7 +324,11 @@ h3 {
 .lines li:first-child { padding-top: 0; }
 .lines li:last-child { border-bottom: none; padding-bottom: 0; }
 
-.line-name { font-weight: 550; }
+.line-name {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 16px;
+}
 .line-name .sku { display: block; margin-top: 3px; }
 
 .qty {
@@ -347,6 +358,7 @@ h3 {
 }
 
 .remove {
+  font-family: var(--font-text);
   background: none; border: none; cursor: pointer;
   color: var(--text-3); font: inherit; font-size: 13px;
   padding: 4px 6px; border-radius: 6px;
