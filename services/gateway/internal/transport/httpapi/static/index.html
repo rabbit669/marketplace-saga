@@ -3,106 +3,131 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Marketplace — checkout saga</title>
+<title>Marketplace</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
-<header>
-  <div class="wrap">
-    <h1>Marketplace</h1>
-    <p class="tagline">
-      Микросервисный checkout. Оформите заказ и посмотрите, что происходит,
-      когда карта отклонена.
+<header class="masthead">
+  <div class="shell">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="name">Marketplace</span>
+    </div>
+    <p class="lede">
+      Оформите заказ и посмотрите, что происходит, когда банк отказывает.
     </p>
     <p class="who" id="who"></p>
   </div>
 </header>
 
-<main class="wrap">
+<main class="shell">
 
   <!-- ============================================================ shop -->
-  <section id="shop-section">
-    <h2>Витрина</h2>
+  <section id="shop-section" class="block">
+    <div class="block-head">
+      <h2>Витрина</h2>
+      <p class="hint">Товары приходят из сервиса каталога</p>
+    </div>
     <div id="products" class="grid">
-      <p class="muted">Загружаю товары…</p>
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
     </div>
   </section>
 
   <!-- ============================================================ cart -->
-  <section id="cart-section" hidden>
-    <h2>Корзина</h2>
-    <table class="cart">
-      <tbody id="cart-rows"></tbody>
-      <tfoot>
-        <tr>
-          <th>Итого</th>
-          <th id="cart-total" class="money"></th>
-        </tr>
-      </tfoot>
-    </table>
+  <section id="cart-section" class="block" hidden>
+    <div class="block-head">
+      <h2>Корзина</h2>
+    </div>
 
-    <fieldset class="pay">
-      <legend>Чем платим</legend>
-      <p class="muted small">
-        Платёжный сервис умеет притворяться. Выберите исход — и увидите,
-        как сага на него реагирует.
+    <div class="panel">
+      <ul id="cart-rows" class="lines"></ul>
+      <div class="total">
+        <span>Итого</span>
+        <strong id="cart-total" class="money"></strong>
+      </div>
+    </div>
+
+    <div class="panel pay">
+      <h3>Чем платим</h3>
+      <p class="hint">
+        Платёжный сервис умеет притворяться. Выберите исход — сага на него
+        отреагирует.
       </p>
 
-      <label class="choice">
-        <input type="radio" name="card" value="pm_test_approve" checked>
-        <span><b>Обычная карта</b> — оплата проходит</span>
-      </label>
+      <div class="cards">
+        <label class="option">
+          <input type="radio" name="card" value="pm_test_approve" checked>
+          <span class="option-body">
+            <span class="option-title">Обычная карта</span>
+            <span class="option-note">оплата проходит</span>
+          </span>
+        </label>
 
-      <label class="choice">
-        <input type="radio" name="card" value="pm_test_decline">
-        <span><b>Карта без денег</b> — банк отказывает навсегда</span>
-      </label>
+        <label class="option">
+          <input type="radio" name="card" value="pm_test_decline">
+          <span class="option-body">
+            <span class="option-title">Карта без денег</span>
+            <span class="option-note">банк отказывает навсегда</span>
+          </span>
+        </label>
 
-      <label class="choice">
-        <input type="radio" name="card" value="pm_test_timeout">
-        <span><b>Банк недоступен</b> — отказ временный, сага повторит попытку</span>
-      </label>
+        <label class="option">
+          <input type="radio" name="card" value="pm_test_timeout">
+          <span class="option-body">
+            <span class="option-title">Банк недоступен</span>
+            <span class="option-note">отказ временный, сага повторит</span>
+          </span>
+        </label>
+      </div>
 
-      <fieldset class="ship">
-        <legend>Доставка</legend>
-        <div class="addr">
+      <details class="ship">
+        <summary>Доставка</summary>
+        <div class="fields">
           <label>Страна <input id="ship-country" value="DE"></label>
           <label>Город <input id="ship-city" value="Berlin"></label>
           <label>Улица <input id="ship-street" value="Torstrasse 1"></label>
           <label>Индекс <input id="ship-postal" value="10119"></label>
           <label>Получатель <input id="ship-recipient" value="A. Customer"></label>
         </div>
-      </fieldset>
+      </details>
 
-      <button id="pay-btn" class="primary">Оплатить</button>
-    </fieldset>
+      <button id="pay-btn" class="btn btn-primary btn-wide">Оплатить</button>
+    </div>
   </section>
 
   <!-- ========================================================== result -->
-  <section id="result-section" hidden>
-    <h2 id="result-title"></h2>
-    <p id="result-summary" class="summary"></p>
-
-    <div id="result-failure" class="failure" hidden>
-      <div class="failure-head">
-        <span class="failure-code" id="failure-code"></span>
-        <span id="failure-message"></span>
-      </div>
-      <p class="muted small" id="failure-step"></p>
+  <section id="result-section" class="block" hidden>
+    <div class="block-head">
+      <h2 id="result-title"></h2>
+      <p id="result-summary" class="lede"></p>
     </div>
 
-    <h3>Что делала сага</h3>
-    <p class="muted small">
-      Пять шагов. Первые два можно отменить, третий — точка невозврата.
-      Если шаг падает, всё, что было до него, отменяется в обратном порядке.
-    </p>
+    <div id="result-failure" class="alert" hidden>
+      <div class="alert-line">
+        <span class="tag" id="failure-code"></span>
+        <span id="failure-message"></span>
+      </div>
+      <p class="hint" id="failure-step"></p>
+    </div>
 
-    <ol id="saga-steps" class="saga"></ol>
+    <div class="panel">
+      <h3>Что делала сага</h3>
+      <p class="hint">
+        Пять шагов. Первые два можно отменить, третий — точка невозврата.
+        Если шаг падает, всё, что было до него, отменяется в обратном порядке.
+      </p>
 
-    <div class="links">
-      <a id="jaeger-link" target="_blank" rel="noopener">Открыть трейс в Jaeger</a>
-      <button id="again-btn" class="secondary">Оформить ещё один</button>
+      <ol id="saga-steps" class="saga"></ol>
+    </div>
+
+    <div class="actions">
+      <button id="again-btn" class="btn">Оформить ещё один</button>
+      <a id="jaeger-link" class="link" target="_blank" rel="noopener">
+        Посмотреть трейс в Jaeger →
+      </a>
     </div>
   </section>
 

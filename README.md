@@ -118,6 +118,18 @@ decline*, *make this payment time out* and *let it through*. Placing an order
 renders the saga's five steps with their real outcome, so the rollback is
 something you watch rather than something you read about.
 
+![The storefront](design-shots/1-shop.png)
+
+Choosing the card that declines and pressing pay gives this:
+
+![A rolled-back checkout](design-shots/3-declined.png)
+
+Two steps are violet because they were **compensated** — the stock hold was
+released and the authorization voided — one is red because it **failed**, and
+three are dimmed because they **never ran**. The orange marker is the pivot: the
+step after which nothing can be undone. That is the entire argument of the
+design, visible in one screen.
+
 It is plain HTML, CSS and one JavaScript file, embedded in the gateway binary:
 no second container, no CORS, no build step. A bundler would make the demo the
 most complicated part of the repository.

@@ -28,6 +28,28 @@ function money(m) {
   return `${whole}.${cents} ${m.currency}`;
 }
 
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s ?? '';
+  return div.innerHTML;
+}
+
+// hueFor gives each product a stable colour.
+//
+// There are no product photographs, and a page of identical grey rectangles
+// looks unfinished. A tint derived from the SKU is deterministic, so a product
+// keeps its colour between reloads and nobody wonders whether it means
+// something.
+function hueFor(sku) {
+  let h = 0;
+  for (let i = 0; i < sku.length; i++) {
+    h = (h * 31 + sku.charCodeAt(i)) % 360;
+  }
+  // Compressed into a range that stays legible against a dark background and
+  // avoids the muddy yellows and greens in the middle.
+  return [255, 275, 200, 320, 15][h % 5];
+}
+
 async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -75,7 +97,7 @@ async function signIn() {
     customer = pair.user;
   }
 
-  $('who').textContent = `Вы вошли как ${customer.email} (${customer.id})`;
+  $('who').textContent = `Вы вошли как ${customer.email}`;
 }
 
 // -------------------------------------------------------------- products
@@ -87,36 +109,48 @@ async function loadProducts() {
     products = data.products || [];
 
     if (products.length === 0) {
-      grid.innerHTML = '<p class="muted">Каталог пуст.</p>';
+      grid.innerHTML = '<p class="empty">Каталог пуст.</p>';
       return;
     }
 
     grid.innerHTML = '';
     for (const p of products) {
-      const card = document.createElement('div');
-      card.className = 'card';
-
-      const attrs = Object.entries(p.attributes || {})
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(', ');
-
-      card.innerHTML = `
-        <div class="sku">${p.sku}</div>
-        <h4>${p.name}</h4>
-        <div class="price">${money(p.price)}</div>
-        ${attrs ? `<div class="attrs">${attrs}</div>` : ''}
-      `;
-
-      const button = document.createElement('button');
-      button.textContent = 'В корзину';
-      button.onclick = () => addToCart(p.id);
-      card.appendChild(button);
-
-      grid.appendChild(card);
+      grid.appendChild(productCard(p));
     }
   } catch (err) {
-    grid.innerHTML = `<div class="error-box">Не удалось загрузить товары: ${err.message}</div>`;
+    grid.innerHTML = `<div class="error-box">Не удалось загрузить товары: ${escapeHtml(err.message)}</div>`;
   }
+}
+
+function productCard(p) {
+  const card = document.createElement('article');
+  card.className = 'card';
+
+  const attrs = Object.entries(p.attributes || {})
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(' · ');
+
+  card.innerHTML = `
+    <div class="thumb" style="--hue: ${hueFor(p.sku)}" aria-hidden="true">
+      ${escapeHtml(p.name.trim().charAt(0).toUpperCase())}
+    </div>
+    <div class="card-body">
+      <div class="sku">${escapeHtml(p.sku)}</div>
+      <h4>${escapeHtml(p.name)}</h4>
+      ${attrs ? `<div class="attrs">${escapeHtml(attrs)}</div>` : ''}
+      <div class="card-foot">
+        <span class="price">${money(p.price)}</span>
+      </div>
+    </div>
+  `;
+
+  const button = document.createElement('button');
+  button.className = 'btn';
+  button.textContent = 'В корзину';
+  button.onclick = () => addToCart(p.id);
+  card.querySelector('.card-foot').appendChild(button);
+
+  return card;
 }
 
 // ------------------------------------------------------------------ cart
@@ -124,6 +158,10 @@ async function loadProducts() {
 function addToCart(id) {
   cart.set(id, (cart.get(id) || 0) + 1);
   renderCart();
+
+  // Bring the cart into view. Adding an item to something off-screen is the
+  // most common way a demo like this seems to do nothing.
+  $('cart-section').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function renderCart() {
@@ -148,25 +186,29 @@ function renderCart() {
     totalMinor += lineTotal;
     currency = p.price.currency;
 
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${p.name}<div class="sku">${p.sku}</div></td>
-      <td><input class="qty" type="number" min="1" max="1000" value="${qty}"></td>
-      <td class="money">${money({ amount_minor: lineTotal, currency })}</td>
-      <td><button class="link">убрать</button></td>
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <div class="line-name">
+        ${escapeHtml(p.name)}
+        <span class="sku">${escapeHtml(p.sku)}</span>
+      </div>
+      <input class="qty" type="number" min="1" max="1000" value="${qty}"
+             aria-label="Количество">
+      <span class="money">${money({ amount_minor: lineTotal, currency })}</span>
+      <button class="remove" aria-label="Убрать">✕</button>
     `;
 
-    tr.querySelector('input').onchange = (e) => {
+    li.querySelector('input').onchange = (e) => {
       const v = Math.max(1, Math.min(1000, parseInt(e.target.value, 10) || 1));
       cart.set(id, v);
       renderCart();
     };
-    tr.querySelector('button').onclick = () => {
+    li.querySelector('.remove').onclick = () => {
       cart.delete(id);
       renderCart();
     };
 
-    rows.appendChild(tr);
+    rows.appendChild(li);
   }
 
   $('cart-total').textContent = money({ amount_minor: totalMinor, currency });
@@ -225,14 +267,11 @@ async function showResult(order, err) {
   }
 
   const rolledBack = order.status === 'cancelled';
-  $('result-title').textContent = rolledBack
-    ? 'Заказ отменён — но всё откатилось'
-    : 'Заказ оформлен';
+  $('result-title').textContent = rolledBack ? 'Заказ отменён' : 'Заказ оформлен';
 
   $('result-summary').innerHTML = rolledBack
-    ? `Заказ <b>${order.id}</b> на <b>${money(order.total)}</b>. ` +
-      `Списания не было, товар не зарезервирован.`
-    : `Заказ <b>${order.id}</b> на <b>${money(order.total)}</b> подтверждён.`;
+    ? `Списания не было и товар не зарезервирован. Заказ <b>${escapeHtml(order.id)}</b> на <b>${money(order.total)}</b>.`
+    : `Заказ <b>${escapeHtml(order.id)}</b> на <b>${money(order.total)}</b> подтверждён.`;
 
   const failure = $('result-failure');
   if (order.failure) {
@@ -241,13 +280,14 @@ async function showResult(order, err) {
     $('failure-message').textContent = order.failure.message;
     $('failure-step').textContent = order.failure.failed_step
       ? `Сломался шаг: ${order.failure.failed_step}` +
-        (order.failure.retryable ? ' (временная ошибка — можно попробовать снова)' : '')
+        (order.failure.retryable ? ' — ошибка временная, можно попробовать снова' : '')
       : '';
   } else {
     failure.hidden = true;
   }
 
   await renderSaga(order.id);
+  $('result-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ------------------------------------------------------------- saga view
@@ -261,31 +301,39 @@ const STEP_NOTES = {
 };
 
 const STEP_COMPENSATION = {
-  reserve_stock: 'резерв снимается',
-  authorize_payment: 'заморозка отменяется',
+  reserve_stock: 'резерв снят',
+  authorize_payment: 'заморозка отменена',
 };
 
-// The pivot: the step after which nothing can be undone. Marking it is the
-// whole argument of the design, and it is invisible without a label.
+// The pivot: the step after which nothing can be undone. Labelling it is the
+// whole argument of the design, and it is invisible without a marker.
 const PIVOT_STEP = 'capture_payment';
 
 const STATUS_LABEL = {
-  pending: 'не выполнялся',
+  pending: '',
   completed: 'выполнен',
   failed: 'ошибка',
   compensated: 'отменён',
-  compensation_failed: 'не удалось отменить',
+  compensation_failed: 'отменить не удалось',
+};
+
+const STATUS_MARK = {
+  completed: '✓',
+  compensated: '↺',
+  failed: '✕',
+  compensation_failed: '!',
+  pending: '·',
 };
 
 async function renderSaga(orderId) {
   const list = $('saga-steps');
-  list.innerHTML = '<li class="muted">Читаю состояние саги…</li>';
+  list.innerHTML = '<li class="loading">Читаю состояние саги…</li>';
 
   let saga;
   try {
     saga = await api(`/orders/${orderId}/saga`);
   } catch (err) {
-    list.innerHTML = `<li class="error-box">Не удалось прочитать сагу: ${err.message}</li>`;
+    list.innerHTML = `<li class="error-box">Не удалось прочитать сагу: ${escapeHtml(err.message)}</li>`;
     return;
   }
 
@@ -293,15 +341,7 @@ async function renderSaga(orderId) {
 
   for (const step of saga.steps || []) {
     const li = document.createElement('li');
-    li.className = `s-${step.status}`;
-
-    const mark = {
-      completed: '✓',
-      compensated: '↺',
-      failed: '✕',
-      compensation_failed: '!',
-      pending: '·',
-    }[step.status] || '·';
+    li.className = `step s-${step.status}`;
 
     const pivot = step.name === PIVOT_STEP
       ? '<span class="pivot">точка невозврата</span>'
@@ -309,20 +349,22 @@ async function renderSaga(orderId) {
 
     let note = STEP_NOTES[step.name] || '';
     if (step.status === 'compensated' && STEP_COMPENSATION[step.name]) {
-      note += ` — ${STEP_COMPENSATION[step.name]}`;
+      note = STEP_COMPENSATION[step.name];
     }
     if (step.error && step.status !== 'pending') {
+      // The last segment of the wrapped error is the readable one; the rest is
+      // internal identifiers.
       note += `<br>${escapeHtml(step.error.split(': ').pop())}`;
     }
 
     const meta = [];
-    if (step.attempts > 0) meta.push(`попыток: ${step.attempts}`);
-    if (step.status !== 'pending') meta.push(STATUS_LABEL[step.status] || step.status);
+    if (step.attempts > 1) meta.push(`попыток: ${step.attempts}`);
+    if (STATUS_LABEL[step.status]) meta.push(STATUS_LABEL[step.status]);
 
     li.innerHTML = `
-      <div class="dot">${mark}</div>
+      <div class="dot" aria-hidden="true">${STATUS_MARK[step.status] || '·'}</div>
       <div>
-        <div class="step-name">${step.name}${pivot}</div>
+        <div class="step-name">${escapeHtml(step.name)}${pivot}</div>
         <div class="step-note">${note}</div>
       </div>
       <div class="step-meta">${meta.join('<br>')}</div>
@@ -331,15 +373,9 @@ async function renderSaga(orderId) {
     list.appendChild(li);
   }
 
-  // The trace link is a deep link into Jaeger, filtered by service. It is the
-  // natural next step for someone who wants to see where the time went.
+  // A deep link into Jaeger, filtered by service. The natural next step for
+  // someone who wants to see where the time went.
   $('jaeger-link').href = 'http://localhost:16686/search?service=order&limit=20';
-}
-
-function escapeHtml(s) {
-  const div = document.createElement('div');
-  div.textContent = s ?? '';
-  return div.innerHTML;
 }
 
 // ------------------------------------------------------------------ boot
@@ -357,7 +393,7 @@ $('again-btn').onclick = () => {
   try {
     await signIn();
   } catch (err) {
-    $('who').innerHTML = `<span class="error-box">Не удалось войти: ${err.message}</span>`;
+    $('who').innerHTML = `<span class="error-box">Не удалось войти: ${escapeHtml(err.message)}</span>`;
     return;
   }
   await loadProducts();
