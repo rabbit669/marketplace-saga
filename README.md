@@ -134,6 +134,11 @@ It is plain HTML, CSS and one JavaScript file, embedded in the gateway binary:
 no second container, no CORS, no build step. A bundler would make the demo the
 most complicated part of the repository.
 
+The two typefaces — Unbounded for the headings, Onest for the text — are also
+embedded, as latin and cyrillic subsets only. Loading them from a CDN would make
+an external network a dependency of a demo that runs on localhost, and would be
+the one part of the page that stops working offline.
+
 Underneath, the same things the API exposes:
 
 ```bash
