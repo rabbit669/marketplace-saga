@@ -51,10 +51,11 @@
 
   /* Two families, with a job each.
 
-     Unbounded is wide, geometric and unmistakably of the moment — it is what
-     gives the page its voice. It is also tiring to read at length, so it is
-     confined to the brand, the headings and the prices, where there are only a
-     few words and they are meant to land.
+     Rubik Glitch is a display face with a deliberate digital-fault
+     distortion. It is the page's voice, and like any strong flavour it is used
+     in a handful of places. Crucially not on prices or buttons: a glitch effect
+     makes digits ambiguous, and an amount of money is the one thing on this
+     page a reader must not have to decipher.
 
      Onest does the reading: body copy, notes, labels, form fields. It is a
      modern grotesque with a proper Cyrillic, drawn for interfaces rather than
@@ -63,7 +64,7 @@
      The fallback stack matters as much as the choice: it is what a reader sees
      for the fraction of a second before the webfont swaps in, and what they see
      permanently if it never arrives. */
-  --font-display: 'Unbounded', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Rubik Glitch', 'Onest', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-text: 'Onest', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
 }
@@ -117,11 +118,9 @@ body {
 
 .name {
   font-family: var(--font-display);
-  font-size: 19px;
-  font-weight: 700;
-  /* Unbounded is drawn wide; pulling the tracking in is what makes it read as
-     deliberate rather than as a default. */
-  letter-spacing: -0.04em;
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 .lede {
@@ -151,18 +150,18 @@ body {
 h2 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 26px;
-  font-weight: 700;
-  letter-spacing: -0.045em;
-  line-height: 1.15;
+  font-size: 30px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.2;
 }
 
 h3 {
   margin: 0 0 4px;
   font-family: var(--font-display);
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: -0.03em;
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 .hint {
@@ -241,11 +240,10 @@ h3 {
 
 .card h4 {
   margin: 0;
-  font-family: var(--font-display);
-  font-size: 15px;
-  font-weight: 700;
-  line-height: 1.3;
-  letter-spacing: -0.035em;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
 }
 
 .attrs {
@@ -264,10 +262,9 @@ h3 {
 }
 
 .price {
-  font-family: var(--font-display);
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: -0.04em;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
 
@@ -342,11 +339,11 @@ h3 {
   color: var(--text-2);
 }
 .total strong {
-  font-family: var(--font-display);
-  font-size: 22px;
-  font-weight: 700;
+  font-size: 24px;
+  font-weight: 650;
   color: var(--text);
-  letter-spacing: -0.045em;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 .remove {
@@ -415,9 +412,9 @@ input:focus {
 .option-title {
   display: block;
   font-family: var(--font-display);
-  font-size: 13.5px;
-  font-weight: 700;
-  letter-spacing: -0.03em;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 .option-note { display: block; margin-top: 3px; font-size: 13px; color: var(--text-3); }
 

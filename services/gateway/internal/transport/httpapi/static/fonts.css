@@ -5,15 +5,34 @@
    would be the one part of the page that stops working offline, and would
    make an external network a dependency of a demo that runs on localhost.
 
-   Unbounded carries the brand and the headings: geometric, wide and set
-   tight, which is the look the page is going for. Onest carries everything
-   read at length, which Unbounded is not good at. Two families is the
-   maximum a page this size can justify.
+   Rubik Glitch carries the brand and the section headings. It is a display
+   face with a deliberate digital-fault distortion, which is a strong flavour:
+   it appears in four or five places on the page and nowhere else. Onest carries
+   everything read at length — product names, prices, buttons — because a glitch
+   effect on a price is a price the reader has to decipher.
 
    Only the latin and cyrillic subsets are shipped. Google splits every font
    into a dozen scripts; the page is Russian, and the rest would quadruple
    the embedded weight for characters that never appear.
 */
+
+@font-face {
+  font-family: 'Rubik Glitch';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/rubikglitch-400-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+@font-face {
+  font-family: 'Rubik Glitch';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/rubikglitch-400-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
 
 @font-face {
   font-family: 'Onest';
@@ -23,7 +42,6 @@
   src: url('fonts/onest-400-cyrillic.woff2') format('woff2');
   unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
-
 @font-face {
   font-family: 'Onest';
   font-style: normal;
@@ -32,7 +50,6 @@
   src: url('fonts/onest-400-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
-
 @font-face {
   font-family: 'Onest';
   font-style: normal;
@@ -41,7 +58,6 @@
   src: url('fonts/onest-500-cyrillic.woff2') format('woff2');
   unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
-
 @font-face {
   font-family: 'Onest';
   font-style: normal;
@@ -50,7 +66,6 @@
   src: url('fonts/onest-500-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
-
 @font-face {
   font-family: 'Onest';
   font-style: normal;
@@ -59,30 +74,11 @@
   src: url('fonts/onest-600-cyrillic.woff2') format('woff2');
   unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
-
 @font-face {
   font-family: 'Onest';
   font-style: normal;
   font-weight: 600;
   font-display: swap;
   src: url('fonts/onest-600-latin.woff2') format('woff2');
-  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-}
-
-@font-face {
-  font-family: 'Unbounded';
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url('fonts/unbounded-700-cyrillic.woff2') format('woff2');
-  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
-}
-
-@font-face {
-  font-family: 'Unbounded';
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url('fonts/unbounded-700-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
